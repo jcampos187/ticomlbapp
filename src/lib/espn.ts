@@ -1,8 +1,6 @@
 const SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard";
 const ODDS_BASE = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/mlb";
 
-const USER_AGENT = "Mozilla/5.0 (compatible; MLBBot/1.0)";
-
 export interface EspnGame {
   id: string;
   awayAbbrev: string;
@@ -28,9 +26,12 @@ export interface EspnOdds {
   homeMLOpen: number | null;
 }
 
+// NOTE: Do NOT set a custom User-Agent header here. ESPN's edge (Akamai)
+// fingerprint-checks the UA against the HTTP client and returns 403 Access
+// Denied for any custom value (e.g. "Mozilla/5.0 (compatible; MLBBot/1.0)").
+// The runtime's default UA is allowed.
 async function fetchJson(url: string): Promise<any> {
   const resp = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT },
     next: { revalidate: 300 },
   });
   if (!resp.ok) throw new Error(`ESPN API error: ${resp.status} ${resp.statusText}`);

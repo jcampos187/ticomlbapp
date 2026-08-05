@@ -314,7 +314,11 @@ export default function Home() {
 
   useEffect(() => {
     fetch("/api/analysis")
-      .then(r => r.ok ? r.json() : Promise.reject(`HTTP ${r.status}`))
+      .then(async r => {
+        const body = await r.json().catch(() => null);
+        if (!r.ok) throw new Error(body?.message || body?.error || `HTTP ${r.status}`);
+        return body;
+      })
       .then(d => {
         if (d.error) throw new Error(d.message || d.error);
         setData(d);
