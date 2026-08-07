@@ -3,6 +3,7 @@ const ODDS_BASE = "https://sports.core.api.espn.com/v2/sports/baseball/leagues/m
 
 export interface EspnGame {
   id: string;
+  startTime: string; // ISO UTC timestamp from ESPN (e.g. "2026-08-07T19:10Z")
   awayAbbrev: string;
   awayName: string;
   homeAbbrev: string;
@@ -42,10 +43,17 @@ export async function fetchScoreboard(date?: string): Promise<EspnGame[]> {
   // ESPN's default scoreboard uses the US-Eastern calendar day, which can lag
   // behind other timezones. Pass the date explicitly (YYYY-MM-DD) when known
   // so we always get the correct slate.
-  const url = date
-    ? `${SCOREBOARD_URL}?dates=${date.replace(/-/g, "")}`
-    : SCOREBOARD_URL;
-  const data = await fetchJson(url);
+  let data: any;
+  if (date) {
+    data = await fetchJson(`${SCOREBOARD_URL}?dates=${date.replace(/-/g, "")}`);
+    // If the requested date has no slate posted yet (ESPN schedules ahead but
+    // occasionally lags), fall back to ESPN's default board instead of
+    // showing an empty list. Any previous-day games returned that way are
+    // already final and get filtered out below.
+    if (!data.events?.length) data = await fetchJson(SCOREBOARD_URL);
+  } else {
+    data = await fetchJson(SCOREBOARD_URL);
+  }
   const games: EspnGame[] = [];
 
   for (const event of data.events || []) {
@@ -63,6 +71,7 @@ export async function fetchScoreboard(date?: string): Promise<EspnGame[]> {
 
     games.push({
       id: comp.id,
+      startTime: event.date || "",
       awayAbbrev: away.team.abbreviation,
       awayName: away.team.shortDisplayName || away.team.displayName,
       homeAbbrev: home.team.abbreviation,

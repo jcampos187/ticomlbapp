@@ -6,7 +6,7 @@ import type { Game, AnalysisResult } from "@/lib/types";
 
 export const revalidate = 300;
 
-/** Local YYYY-MM-DD (MLB games are scheduled on US dates, so UTC could be off by a day in the evening). */
+/** Server-local YYYY-MM-DD (MLB games are scheduled on US dates, so UTC could be off by a day in the evening). */
 function localDate(): string {
   const now = new Date();
   const y = now.getFullYear();
@@ -15,9 +15,29 @@ function localDate(): string {
   return `${y}-${m}-${d}`;
 }
 
-export async function GET() {
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidDate(s: string): boolean {
+  if (!DATE_RE.test(s)) return false;
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return false;
+  // Reject impossible dates like 2026-02-31 that JS silently rolls over to
+  // March 3 when parsing.
+  return (
+    d.getUTCFullYear() === Number(s.slice(0, 4)) &&
+    d.getUTCMonth() + 1 === Number(s.slice(5, 7)) &&
+    d.getUTCDate() === Number(s.slice(8, 10))
+  );
+}
+
+export async function GET(request: Request) {
   try {
-    const today = localDate();
+    // Prefer the date computed in the caller's own timezone (the web app
+    // passes its local date). This also keys the response cache per-date, so
+    // a stale response from yesterday can never be served for today. Falls
+    // back to the server's local date for direct API calls.
+    const requested = new URL(request.url).searchParams.get("date");
+    const today = requested && isValidDate(requested) ? requested : localDate();
 
     // 1. Fetch scoreboard (games + basic info) + MLB schedule (pitchers)
     const [espnGames, teamPitchers] = await Promise.all([
@@ -49,6 +69,7 @@ export async function GET() {
 
       games.push({
         id: eg.id,
+        startTime: eg.startTime,
         status: eg.status,
         awayTeam: TEAM_MAP[eg.awayAbbrev] || eg.awayName,
         homeTeam: TEAM_MAP[eg.homeAbbrev] || eg.homeName,
@@ -149,7 +170,7 @@ export async function GET() {
 
     return NextResponse.json(result, {
       headers: {
-        "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600",
+        "Cache-Control": "public, s-maxage=300, stale-while-revalidate=60",
       },
     });
   } catch (error) {

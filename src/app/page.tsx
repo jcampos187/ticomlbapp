@@ -4,6 +4,14 @@ import { useEffect, useState } from "react";
 import type { AnalysisResult } from "@/lib/types";
 import { formatOdds } from "@/lib/analysis";
 
+/** Local YYYY-MM-DD computed in the viewer's own timezone. */
+function localDateStr(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function OddsDisplay({ odds }: { odds: number }) {
   const cls = odds > 0 ? "odds-positive" : odds < 0 ? "odds-negative" : "";
   return <span className={`font-bold ${cls}`}>{formatOdds(odds)}</span>;
@@ -35,6 +43,46 @@ function StatBar({ label, value }: { label: string; value: string }) {
   );
 }
 
+function GameTime({ startTime, status }: { startTime: string; status: string }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick every 30s so the countdown stays fresh without constant re-renders.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  const d = new Date(startTime);
+  if (Number.isNaN(d.getTime())) return null;
+
+  const timeLabel = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+
+  // Live games: note when the first pitch was thrown.
+  if (status === "live") {
+    return <span className="text-xs text-muted">🕐 {timeLabel} start</span>;
+  }
+
+  // Scheduled games: show the local start time plus a friendly countdown.
+  const diffMs = d.getTime() - now;
+  let countdown = "";
+  if (diffMs > 0) {
+    const mins = Math.max(1, Math.round(diffMs / 60000));
+    if (mins < 60) countdown = `in ${mins}m`;
+    else {
+      const h = Math.floor(mins / 60);
+      const m = mins % 60;
+      countdown = `in ${h}h${m ? ` ${m}m` : ""}`;
+    }
+  }
+
+  return (
+    <span className="text-xs text-muted whitespace-nowrap">
+      🕐 {timeLabel}
+      {countdown && <span className="text-green-400/80 ml-1">· {countdown}</span>}
+    </span>
+  );
+}
+
 function KBar({ k9 }: { k9: number | null }) {
   if (!k9) return null;
   const pct = Math.min((k9 / 12) * 100, 100);
@@ -57,9 +105,12 @@ function GameCard({ game, index }: { game: AnalysisResult["games"][0]; index: nu
       onClick={() => setShowDetails(!showDetails)}
     >
       <div className="flex items-center justify-between mb-2">
-        <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full text-muted">
-          {game.status}
-        </span>
+        <div className="flex items-center gap-2 min-w-0">
+          <GameTime startTime={game.startTime} status={game.status} />
+          <span className="text-xs bg-slate-700 px-2 py-0.5 rounded-full text-muted whitespace-nowrap">
+            {game.status === "live" ? "● Live" : game.status}
+          </span>
+        </div>
         {game.overUnder > 0 && (
           <span className="text-xs text-muted">O/U {game.overUnder}</span>
         )}
@@ -311,9 +362,17 @@ export default function Home() {
   const [data, setData] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // "Today" from the viewer's perspective — passed to the API so the server
+  // never guesses based on its own (UTC) clock, and so the response cache is
+  // keyed per-date (a stale response can never serve the wrong day's games).
+  const [date, setDate] = useState(() => localDateStr());
+  const [reload, setReload] = useState(0);
 
   useEffect(() => {
-    fetch("/api/analysis")
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetch(`/api/analysis?date=${date}`)
       .then(async r => {
         const body = await r.json().catch(() => null);
         if (!r.ok) throw new Error(body?.message || body?.error || `HTTP ${r.status}`);
@@ -321,13 +380,33 @@ export default function Home() {
       })
       .then(d => {
         if (d.error) throw new Error(d.message || d.error);
-        setData(d);
+        // Cache safety net: if a shared cache ever served a response computed
+        // for a different date than requested (shouldn't happen now that the
+        // cache is keyed per-date), re-request once.
+        if (!cancelled && reload === 0 && d.date && d.date !== date) {
+          setReload(1);
+          return;
+        }
+        if (!cancelled) setData(d);
       })
-      .catch(e => setError(String(e)))
-      .finally(() => setLoading(false));
+      .catch(e => { if (!cancelled) setError(String(e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [date, reload]);
+
+  // If the app is left open across midnight, roll over to the new day's
+  // slate automatically (re-fetches via the date state change above).
+  useEffect(() => {
+    const id = setInterval(() => {
+      const today = localDateStr();
+      setDate(prev => (today === prev ? prev : today));
+    }, 60_000);
+    return () => clearInterval(id);
   }, []);
 
-  if (loading) return <LoadingState />;
+  // Keep the previous day's dashboard visible while the new day's data loads
+  // (e.g. the automatic rollover at midnight) instead of flashing a spinner.
+  if (loading && !data) return <LoadingState />;
   if (error) return <ErrorState message={error} />;
   if (!data || !data.games.length) return <ErrorState message="No MLB games scheduled today." />;
 

@@ -1,5 +1,6 @@
 export interface Game {
   id: string;
+  startTime: string; // ISO UTC timestamp (e.g. "2026-08-07T19:10Z")
   status: "scheduled" | "live" | "final";
   awayTeam: string;
   homeTeam: string;
