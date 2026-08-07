@@ -192,6 +192,14 @@ interface OppDef {
 const REC_SHARE = 0.3;
 
 /**
+ * A lead back's typical share of an opponent defense's total rushing yards
+ * allowed. Like receiving, a defense's rushing allowance is split across the
+ * whole backfield, so comparing one RB's yards to the FULL allowance would make
+ * every RB look like an Under. A bell-cow RB handles roughly 70% of carries.
+ */
+const RUSH_SHARE = 0.7;
+
+/**
  * Project a line for a player's most relevant market, blending the player's
  * season per-game average with the opponent defense's actual yards/TDs
  * allowed per game (from the site API's `results.opponent` split). The result
@@ -214,29 +222,29 @@ function projectProp(
   const candidate = (() => {
     if (player.position === "QB") {
       if (player.passingYardsPerGame && player.passingYardsPerGame > 100) {
-        return { market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235, oppVal: oppDef.passYds, oppLabel: "pass DEF allows", unit: "yds", shareAdjusted: false };
+        return { market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235, oppVal: oppDef.passYds, oppLabel: "pass DEF allows", unit: "yds", shareAdjusted: false as const, share: null, shareLabel: null };
       }
       if (player.passingTdsPerGame && player.passingTdsPerGame > 0.5) {
-        return { market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5, oppVal: oppDef.passTds, oppLabel: "pass DEF allows", unit: "TDs", shareAdjusted: false };
+        return { market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5, oppVal: oppDef.passTds, oppLabel: "pass DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
       }
     }
     if (player.position === "RB") {
       if (player.rushingYardsPerGame && player.rushingYardsPerGame > 25) {
-        return { market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65, oppVal: oppDef.rushYds, oppLabel: "rush DEF allows", unit: "yds", shareAdjusted: false };
+        return { market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65, oppVal: oppDef.rushYds, oppLabel: "rush DEF allows", unit: "yds", shareAdjusted: true as const, share: RUSH_SHARE, shareLabel: "RB" };
       }
       if (player.rushingTdsPerGame && player.rushingTdsPerGame > 0.2) {
-        return { market: "Rushing TDs", playerAvg: player.rushingTdsPerGame, baseline: 0.5, oppVal: oppDef.rushTds, oppLabel: "rush DEF allows", unit: "TDs", shareAdjusted: false };
+        return { market: "Rushing TDs", playerAvg: player.rushingTdsPerGame, baseline: 0.5, oppVal: oppDef.rushTds, oppLabel: "rush DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
       }
       if (player.receivingYardsPerGame && player.receivingYardsPerGame > 15) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true };
+        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true as const, share: REC_SHARE, shareLabel: "WR" };
       }
     }
     if (player.position === "WR" || player.position === "TE") {
       if (player.receivingYardsPerGame && player.receivingYardsPerGame > 20) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true };
+        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true as const, share: REC_SHARE, shareLabel: "WR" };
       }
       if (player.receivingTdsPerGame && player.receivingTdsPerGame > 0.2) {
-        return { market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppVal: oppDef.recTds, oppLabel: "rec TD DEF allows", unit: "TDs", shareAdjusted: false };
+        return { market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppVal: oppDef.recTds, oppLabel: "rec TD DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
       }
     }
     return null;
@@ -249,23 +257,24 @@ function projectProp(
   ];
 
   // Matchup-aware: blend the player's average with what the opponent defense
-  // actually concedes per game when we have it. For receiving-yards markets
-  // (WR/TE/RB), the defense's TOTAL receiving yards allowed is spread across
-  // the whole receiving corps, so we compare against a share of it — otherwise
-  // every WR would read as a huge Under and never rank.
+  // actually concedes per game when we have it. For yards markets that are
+  // spread across multiple players (receiving yards across the corps, rushing
+  // yards across the backfield), the defense's TOTAL allowance is compared
+  // against a share of it — otherwise every WR/RB would read as a huge Under
+  // and never rank.
   let blended = candidate.playerAvg;
   let margin = candidate.playerAvg - candidate.baseline;
   const oppVal = candidate.oppVal; // capture so TS narrows the union prop
   const effOpp =
     oppVal != null && oppVal > 0 && candidate.shareAdjusted
-      ? oppVal * REC_SHARE
+      ? oppVal * candidate.share
       : oppVal;
   if (effOpp != null && effOpp > 0) {
     blended = candidate.playerAvg * 0.6 + effOpp * 0.4;
     margin = candidate.playerAvg - effOpp;
     reasons.push(
       candidate.shareAdjusted
-        ? `rec DEF allows ~${oppVal!.toFixed(0)} yds/g (WR share ~${effOpp.toFixed(0)})`
+        ? `${candidate.oppLabel} ~${oppVal!.toFixed(0)} yds/g (${candidate.shareLabel} share ~${effOpp.toFixed(0)})`
         : `${candidate.oppLabel} ~${effOpp.toFixed(candidate.unit === "TDs" ? 2 : 0)} ${candidate.unit}/g`
     );
   } else {
@@ -287,10 +296,13 @@ function projectProp(
   let direction: "Over" | "Under";
   let score: number;
   const refVal = effOpp != null ? effOpp : candidate.baseline;
+  // Share-adjusted labels read better without the verb: "rec DEF WR-share"
+  // instead of "rec DEF allows WR-share".
+  const defLabel = candidate.oppLabel.replace(/ allows$/, "");
   const refLabel =
     effOpp != null
       ? candidate.shareAdjusted
-        ? "rec DEF WR-share"
+        ? `${defLabel} ${candidate.shareLabel}-share`
         : candidate.oppLabel
       : "league baseline";
   if (margin >= overThreshold) {
