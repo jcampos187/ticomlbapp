@@ -153,6 +153,10 @@ export async function GET(request: Request) {
         provider: odds.provider,
         awayPpg: awayStats?.pointsPerGame ?? null,
         homePpg: homeStats?.pointsPerGame ?? null,
+        awayDefPassYds: awayStats?.passYdsAllowedPerGame ?? null,
+        awayDefRushYds: awayStats?.rushYdsAllowedPerGame ?? null,
+        homeDefPassYds: homeStats?.passYdsAllowedPerGame ?? null,
+        homeDefRushYds: homeStats?.rushYdsAllowedPerGame ?? null,
         awayProps: buildProps(game.awayTeamId, game.awayAbbrev),
         homeProps: buildProps(game.homeTeamId, game.homeAbbrev),
       });

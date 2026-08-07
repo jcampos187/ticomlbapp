@@ -40,6 +40,12 @@ export interface NflGame {
   // Team scoring context (points per game)
   awayPpg: number | null;
   homePpg: number | null;
+  // Opponent defensive context: what each team's defense allows per game
+  // (from the site API's `results.opponent` split). Used for prop projections.
+  awayDefPassYds: number | null;
+  awayDefRushYds: number | null;
+  homeDefPassYds: number | null;
+  homeDefRushYds: number | null;
   // Prop candidates for each side
   awayProps: NflPropCandidate[];
   homeProps: NflPropCandidate[];

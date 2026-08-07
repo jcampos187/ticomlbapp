@@ -235,41 +235,58 @@ export async function fetchNflPlayerStats(
 }
 
 export interface TeamSeasonStats {
+  /** Own points scored per game (for totals analysis). */
   pointsPerGame: number | null;
-  passingYardsPerGame: number | null;
-  rushingYardsPerGame: number | null;
-  receivingYardsPerGame: number | null;
-  yardsAllowed: number | null;
-  pointsAllowed: number | null;
+  /** What this team's defense allows — per game — via the site API's
+   * `results.opponent` split (verified populated; the core API's
+   * `defensive.yardsAllowed` is hardcoded 0). */
+  passYdsAllowedPerGame: number | null;
+  rushYdsAllowedPerGame: number | null;
 }
 
-/** Season team stats. Defensive yards/points allowed are unreliable on ESPN's
- * team endpoint (return 0), so callers should treat those as best-effort. */
+/**
+ * Season team stats from the SITE API (`/teams/{id}/statistics`). The core
+ * API's defensive category returns `yardsAllowed`/`pointsAllowed` as hardcoded
+ * 0, but the site API exposes a `results.opponent` split with real per-game
+ * opponent totals (what the team's defense allows) — the reliable defensive
+ * context used for prop projections.
+ */
 export async function fetchNflTeamStats(
   teamId: number,
   year: number,
-  seasonType: number
+  _seasonType: number
 ): Promise<TeamSeasonStats | null> {
   try {
-    const url = `${CORE_BASE}/seasons/${year}/types/${seasonType}/teams/${teamId}/statistics`;
+    const url = `https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/${teamId}/statistics?season=${year}`;
     const data = await fetchJson(url);
-    const categories = data.splits?.categories || [];
+    const results = data?.results || {};
 
-    const find = (catName: string, statName: string): number | null => {
-      const cat = categories.find((c: any) => c.name === catName);
+    // Own stats: { categories: [...] }
+    const ownCats = results.stats?.categories || [];
+    const own = (catName: string, statName: string): number | null => {
+      const cat = ownCats.find((c: any) => c.name === catName);
       const stat = cat?.stats?.find((s: any) => s.name === statName);
       if (stat?.value == null) return null;
       const n = Number(stat.value);
       return Number.isNaN(n) ? null : n;
     };
 
+    // Opponent stats: [ { name, stats: [...] } ] — what opponents did
+    // against this team (i.e. what this defense allows).
+    const oppCats = results.opponent || [];
+    const opp = (catName: string, statName: string): number | null => {
+      const cat = oppCats.find((c: any) => c.name === catName);
+      const stat = cat?.stats?.find((s: any) => s.name === statName);
+      const v = stat?.perGameValue ?? stat?.value;
+      if (v == null) return null;
+      const n = Number(v);
+      return Number.isNaN(n) ? null : n;
+    };
+
     return {
-      pointsPerGame: find("scoring", "totalPointsPerGame"),
-      passingYardsPerGame: find("passing", "netPassingYardsPerGame"),
-      rushingYardsPerGame: find("rushing", "rushingYardsPerGame"),
-      receivingYardsPerGame: find("receiving", "receivingYardsPerGame"),
-      yardsAllowed: find("defensive", "yardsAllowed"),
-      pointsAllowed: find("defensive", "pointsAllowed"),
+      pointsPerGame: own("scoring", "totalPointsPerGame"),
+      passYdsAllowedPerGame: opp("passing", "netPassingYards"),
+      rushYdsAllowedPerGame: opp("rushing", "rushingYards"),
     };
   } catch {
     return null;

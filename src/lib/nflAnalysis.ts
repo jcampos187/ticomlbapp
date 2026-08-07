@@ -174,12 +174,20 @@ interface PropProjection {
 const MIN_GAMES = 4;
 
 /**
- * Project a line for a player's most relevant market. The line is a
- * statistical projection from the player's season per-game average — never a
- * real sportsbook number. Direction leans Over for players producing well
- * above the league baseline, Under for those below it.
+ * Project a line for a player's most relevant market, blending the player's
+ * season per-game average with the opponent defense's actual yards allowed
+ * per game (from the site API's `results.opponent` split). The result is a
+ * statistical projection — never a real sportsbook number.
+ *
+ * Direction: Over when the player produces more per game than this specific
+ * defense typically concedes (good matchup); Under when the defense allows
+ * far less than the player's average (tough matchup). Falls back to league
+ * baselines when defensive data is unavailable.
  */
-function projectProp(player: NflPropCandidate): PropProjection | null {
+function projectProp(
+  player: NflPropCandidate,
+  oppDef: { passYds: number | null; rushYds: number | null }
+): PropProjection | null {
   if (player.gamesPlayed < MIN_GAMES) return null;
 
   // Pick the player's best market by position, requiring meaningful volume
@@ -187,26 +195,26 @@ function projectProp(player: NflPropCandidate): PropProjection | null {
   const candidate = (() => {
     if (player.position === "QB") {
       if (player.passingYardsPerGame && player.passingYardsPerGame > 100) {
-        return { market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235 };
+        return { market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235, oppYds: oppDef.passYds, oppLabel: "pass DEF allows" };
       }
       if (player.passingTdsPerGame && player.passingTdsPerGame > 0.5) {
-        return { market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5 };
+        return { market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5, oppYds: null, oppLabel: "" };
       }
     }
     if (player.position === "RB") {
       if (player.rushingYardsPerGame && player.rushingYardsPerGame > 25) {
-        return { market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65 };
+        return { market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65, oppYds: oppDef.rushYds, oppLabel: "rush DEF allows" };
       }
       if (player.receivingYardsPerGame && player.receivingYardsPerGame > 15) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35 };
+        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35, oppYds: oppDef.passYds, oppLabel: "pass DEF allows" };
       }
     }
     if (player.position === "WR" || player.position === "TE") {
       if (player.receivingYardsPerGame && player.receivingYardsPerGame > 20) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55 };
+        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55, oppYds: oppDef.passYds, oppLabel: "pass DEF allows" };
       }
       if (player.receivingTdsPerGame && player.receivingTdsPerGame > 0.2) {
-        return { market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4 };
+        return { market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppYds: null, oppLabel: "" };
       }
     }
     return null;
@@ -214,33 +222,57 @@ function projectProp(player: NflPropCandidate): PropProjection | null {
 
   if (!candidate) return null;
 
-  // The projected line is the player's own per-game average, rounded to a
-  // typical prop increment (0.5).
-  const projectedLine = Math.round(candidate.playerAvg * 2) / 2;
+  const reasons: string[] = [
+    `${player.statsSeason} season: ${candidate.playerAvg.toFixed(1)}/game (${player.gamesPlayed} GP)`,
+  ];
 
-  // Direction + score: Over leans for above-baseline producers (the stars),
-  // ranked by how far above the league baseline they are. Under leans are
-  // mild fades scored much lower so they only surface when few Over props exist.
-  const margin = candidate.playerAvg - candidate.baseline;
+  // Matchup-aware: blend the player's average with what the opponent defense
+  // actually concedes per game when we have it.
+  let blended = candidate.playerAvg;
+  let margin = candidate.playerAvg - candidate.baseline;
+  let oppReason = `League baseline ~${candidate.baseline}`;
+  if (candidate.oppYds && candidate.oppYds > 0) {
+    blended = candidate.playerAvg * 0.6 + candidate.oppYds * 0.4;
+    margin = candidate.playerAvg - candidate.oppYds;
+    oppReason = `${candidate.oppLabel} ~${candidate.oppYds.toFixed(0)} yds/g`;
+  }
+
+  // The projected line is the matchup-blended estimate, rounded to a typical
+  // prop increment (0.5).
+  const projectedLine = Math.round(blended * 2) / 2;
+
+  // Direction + score: Over when the player out-produces the specific defense
+  // (or baseline), scored by how much. Under leans are mild fades ranked below
+  // Over stars so they only surface when few Over props exist.
   let direction: "Over" | "Under";
   let score: number;
   if (margin >= 10) {
     direction = "Over";
-    score = 10 + margin / 6; // e.g. +20 over baseline → ~13.3
+    reasons.push(`Outpaces ${candidate.oppLabel} (~${candidate.oppYds?.toFixed(0)} yds/g)`);
+    score = 10 + margin / 6;
   } else if (margin <= -15) {
     direction = "Under";
-    score = -margin / 15; // e.g. -85 → ~5.7 (ranks below Over stars)
+    // Note: a defense allowing MORE than the player produces is not a
+    // favorable matchup for the player — their own low average dominates.
+    reasons.push(`Below ${candidate.oppLabel} (~${candidate.oppYds?.toFixed(0)} yds/g)`);
+    score = -margin / 15;
   } else {
-    // Near baseline — no clear lean, skip to keep picks meaningful.
+    // No clear lean — skip to keep picks meaningful.
     return null;
   }
+  if (candidate.oppYds == null || candidate.oppYds <= 0) {
+    reasons.push(oppReason);
+  }
 
-  const reasons: string[] = [
-    `${player.statsSeason} season: ${candidate.playerAvg.toFixed(1)}/game (${player.gamesPlayed} GP)`,
-    `League baseline ~${candidate.baseline}`,
-  ];
-
-  return { ...candidate, projectedLine, direction, score, reasons };
+  return {
+    market: candidate.market,
+    playerAvg: candidate.playerAvg,
+    baseline: candidate.baseline,
+    projectedLine,
+    direction,
+    score,
+    reasons,
+  };
 }
 
 export function analyzeNflProps(games: NflGame[]): NflPropPick[] {
@@ -253,9 +285,14 @@ export function analyzeNflProps(games: NflGame[]): NflPropPick[] {
       const candidates = side === "away" ? game.awayProps : game.homeProps;
       const opponent = side === "away" ? game.homeTeam : game.awayTeam;
       const teamAbbrev = side === "away" ? game.awayAbbrev : game.homeAbbrev;
+      // A player on the away team faces the HOME defense and vice versa.
+      const oppDef = {
+        passYds: side === "away" ? game.homeDefPassYds : game.awayDefPassYds,
+        rushYds: side === "away" ? game.homeDefRushYds : game.awayDefRushYds,
+      };
 
       for (const player of candidates) {
-        const proj = projectProp(player);
+        const proj = projectProp(player, oppDef);
         if (!proj) continue;
 
         props.push({
