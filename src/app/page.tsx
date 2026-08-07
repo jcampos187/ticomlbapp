@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react";
 import type { AnalysisResult } from "@/lib/types";
 import { formatOdds } from "@/lib/analysis";
+import { GameTime } from "@/components/GameTime";
+import { NflDashboard } from "@/components/NflDashboard";
 
 /** Local YYYY-MM-DD computed in the viewer's own timezone. */
 function localDateStr(d: Date = new Date()): string {
@@ -40,46 +42,6 @@ function StatBar({ label, value }: { label: string; value: string }) {
       <span className="text-muted">{label}</span>
       <span className="font-medium">{value}</span>
     </div>
-  );
-}
-
-function GameTime({ startTime, status }: { startTime: string; status: string }) {
-  const [now, setNow] = useState(() => Date.now());
-
-  // Tick every 30s so the countdown stays fresh without constant re-renders.
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const d = new Date(startTime);
-  if (Number.isNaN(d.getTime())) return null;
-
-  const timeLabel = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-
-  // Live games: note when the first pitch was thrown.
-  if (status === "live") {
-    return <span className="text-xs text-muted">🕐 {timeLabel} start</span>;
-  }
-
-  // Scheduled games: show the local start time plus a friendly countdown.
-  const diffMs = d.getTime() - now;
-  let countdown = "";
-  if (diffMs > 0) {
-    const mins = Math.max(1, Math.round(diffMs / 60000));
-    if (mins < 60) countdown = `in ${mins}m`;
-    else {
-      const h = Math.floor(mins / 60);
-      const m = mins % 60;
-      countdown = `in ${h}h${m ? ` ${m}m` : ""}`;
-    }
-  }
-
-  return (
-    <span className="text-xs text-muted whitespace-nowrap">
-      🕐 {timeLabel}
-      {countdown && <span className="text-green-400/80 ml-1">· {countdown}</span>}
-    </span>
   );
 }
 
@@ -358,7 +320,46 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
+function SportTabs({ sport, onChange }: { sport: "mlb" | "nfl"; onChange: (s: "mlb" | "nfl") => void }) {
+  return (
+    <div className="flex justify-center mb-8 animate-in">
+      <div className="inline-flex glass rounded-xl p-1 gap-1">
+        <button
+          onClick={() => onChange("mlb")}
+          className={`px-6 py-2 rounded-lg text-sm font-semibold transition ${sport === "mlb" ? "bg-blue-600 text-white shadow" : "text-muted hover:text-white"}`}
+        >
+          ⚾ MLB
+        </button>
+        <button
+          onClick={() => onChange("nfl")}
+          className={`px-6 py-2 rounded-lg text-sm font-semibold transition ${sport === "nfl" ? "bg-green-600 text-white shadow" : "text-muted hover:text-white"}`}
+        >
+          🏈 NFL
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
+  const [sport, setSport] = useState<"mlb" | "nfl">(() => {
+    if (typeof window === "undefined") return "mlb";
+    return localStorage.getItem("ticomlbapp-sport") === "nfl" ? "nfl" : "mlb";
+  });
+
+  useEffect(() => {
+    localStorage.setItem("ticomlbapp-sport", sport);
+  }, [sport]);
+
+  return (
+    <>
+      <SportTabs sport={sport} onChange={setSport} />
+      {sport === "mlb" ? <MlbDashboard /> : <NflDashboard />}
+    </>
+  );
+}
+
+function MlbDashboard() {
   const [data, setData] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
