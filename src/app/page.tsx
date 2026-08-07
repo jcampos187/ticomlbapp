@@ -342,18 +342,24 @@ function SportTabs({ sport, onChange }: { sport: "mlb" | "nfl"; onChange: (s: "m
 }
 
 export default function Home() {
-  const [sport, setSport] = useState<"mlb" | "nfl">(() => {
-    if (typeof window === "undefined") return "mlb";
-    return localStorage.getItem("ticomlbapp-sport") === "nfl" ? "nfl" : "mlb";
-  });
+  // Server always renders MLB first; the saved tab is restored after hydration
+  // so the server/client markup matches (avoids React hydration errors from
+  // reading localStorage during the initial render).
+  const [sport, setSport] = useState<"mlb" | "nfl">("mlb");
 
   useEffect(() => {
-    localStorage.setItem("ticomlbapp-sport", sport);
-  }, [sport]);
+    const saved = localStorage.getItem("ticomlbapp-sport");
+    if (saved === "nfl" || saved === "mlb") setSport(saved);
+  }, []);
+
+  const changeSport = (s: "mlb" | "nfl") => {
+    setSport(s);
+    localStorage.setItem("ticomlbapp-sport", s);
+  };
 
   return (
     <>
-      <SportTabs sport={sport} onChange={setSport} />
+      <SportTabs sport={sport} onChange={changeSport} />
       {sport === "mlb" ? <MlbDashboard /> : <NflDashboard />}
     </>
   );
