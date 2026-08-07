@@ -181,6 +181,7 @@ interface OppDef {
   rushTds: number | null;
   recTds: number | null;
   recYds: number | null;
+  recRecs: number | null;
 }
 
 /**
@@ -198,6 +199,71 @@ const REC_SHARE = 0.3;
  * every RB look like an Under. A bell-cow RB handles roughly 70% of carries.
  */
 const RUSH_SHARE = 0.7;
+
+/** A candidate market for a player's projected prop (one per qualifying market). */
+interface PropCandidate {
+  market: string;
+  playerAvg: number;
+  baseline: number;
+  oppVal: number | null;
+  oppLabel: string;
+  unit: "yds" | "TDs" | "recs";
+  /** Positional share of the defense's allowance this player competes for
+   * (WR/TE/RB split the corps/backfield), or null for whole-allowance markets
+   * like QB passing yards/TDs. Non-null means share-adjusted. */
+  share: number | null;
+  shareLabel: string | null;
+}
+
+/**
+ * Every qualifying market for a player, ordered as fallbacks but evaluated by
+ * edge strength (see `projectProp`). Backups with a handful of stats never
+ * rank because each market requires meaningful per-game volume.
+ */
+function buildCandidates(player: NflPropCandidate, oppDef: OppDef): PropCandidate[] {
+  const out: PropCandidate[] = [];
+
+  if (player.position === "QB") {
+    if (player.passingYardsPerGame && player.passingYardsPerGame > 100) {
+      out.push({ market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235, oppVal: oppDef.passYds, oppLabel: "pass DEF allows", unit: "yds", share: null, shareLabel: null });
+    }
+    if (player.passingTdsPerGame && player.passingTdsPerGame > 0.5) {
+      out.push({ market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5, oppVal: oppDef.passTds, oppLabel: "pass DEF allows", unit: "TDs", share: null, shareLabel: null });
+    }
+  }
+
+  if (player.position === "RB") {
+    if (player.rushingYardsPerGame && player.rushingYardsPerGame > 25) {
+      out.push({ market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65, oppVal: oppDef.rushYds, oppLabel: "rush DEF allows", unit: "yds", share: RUSH_SHARE, shareLabel: "RB" });
+    }
+    if (player.rushingTdsPerGame && player.rushingTdsPerGame > 0.2) {
+      out.push({ market: "Rushing TDs", playerAvg: player.rushingTdsPerGame, baseline: 0.5, oppVal: oppDef.rushTds, oppLabel: "rush DEF allows", unit: "TDs", share: null, shareLabel: null });
+    }
+    if (player.receivingYardsPerGame && player.receivingYardsPerGame > 15) {
+      out.push({ market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", share: REC_SHARE, shareLabel: "WR" });
+    }
+    if (player.receivingTdsPerGame && player.receivingTdsPerGame > 0.2) {
+      out.push({ market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppVal: oppDef.recTds, oppLabel: "rec TD DEF allows", unit: "TDs", share: null, shareLabel: null });
+    }
+    if (player.receptionsPerGame && player.receptionsPerGame > 2) {
+      out.push({ market: "Receptions", playerAvg: player.receptionsPerGame, baseline: 2.5, oppVal: oppDef.recRecs, oppLabel: "rec DEF allows", unit: "recs", share: REC_SHARE, shareLabel: "WR" });
+    }
+  }
+
+  if (player.position === "WR" || player.position === "TE") {
+    if (player.receivingYardsPerGame && player.receivingYardsPerGame > 20) {
+      out.push({ market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", share: REC_SHARE, shareLabel: "WR" });
+    }
+    if (player.receptionsPerGame && player.receptionsPerGame > 2.5) {
+      out.push({ market: "Receptions", playerAvg: player.receptionsPerGame, baseline: 4.5, oppVal: oppDef.recRecs, oppLabel: "rec DEF allows", unit: "recs", share: REC_SHARE, shareLabel: "WR" });
+    }
+    if (player.receivingTdsPerGame && player.receivingTdsPerGame > 0.2) {
+      out.push({ market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppVal: oppDef.recTds, oppLabel: "rec TD DEF allows", unit: "TDs", share: null, shareLabel: null });
+    }
+  }
+
+  return out;
+}
 
 /**
  * Project a line for a player's most relevant market, blending the player's
@@ -219,62 +285,49 @@ function projectProp(
   // Pick the player's best market by position, requiring meaningful volume
   // so backups with a handful of yards never rank. Yards markets use the
   // defense's yards allowed; TD markets use the defense's TDs allowed.
-  const candidate = (() => {
-    if (player.position === "QB") {
-      if (player.passingYardsPerGame && player.passingYardsPerGame > 100) {
-        return { market: "Passing Yards", playerAvg: player.passingYardsPerGame, baseline: 235, oppVal: oppDef.passYds, oppLabel: "pass DEF allows", unit: "yds", shareAdjusted: false as const, share: null, shareLabel: null };
-      }
-      if (player.passingTdsPerGame && player.passingTdsPerGame > 0.5) {
-        return { market: "Passing TDs", playerAvg: player.passingTdsPerGame, baseline: 1.5, oppVal: oppDef.passTds, oppLabel: "pass DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
-      }
-    }
-    if (player.position === "RB") {
-      if (player.rushingYardsPerGame && player.rushingYardsPerGame > 25) {
-        return { market: "Rushing Yards", playerAvg: player.rushingYardsPerGame, baseline: 65, oppVal: oppDef.rushYds, oppLabel: "rush DEF allows", unit: "yds", shareAdjusted: true as const, share: RUSH_SHARE, shareLabel: "RB" };
-      }
-      if (player.rushingTdsPerGame && player.rushingTdsPerGame > 0.2) {
-        return { market: "Rushing TDs", playerAvg: player.rushingTdsPerGame, baseline: 0.5, oppVal: oppDef.rushTds, oppLabel: "rush DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
-      }
-      if (player.receivingYardsPerGame && player.receivingYardsPerGame > 15) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 35, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true as const, share: REC_SHARE, shareLabel: "WR" };
-      }
-    }
-    if (player.position === "WR" || player.position === "TE") {
-      if (player.receivingYardsPerGame && player.receivingYardsPerGame > 20) {
-        return { market: "Receiving Yards", playerAvg: player.receivingYardsPerGame, baseline: 55, oppVal: oppDef.recYds, oppLabel: "rec DEF allows", unit: "yds", shareAdjusted: true as const, share: REC_SHARE, shareLabel: "WR" };
-      }
-      if (player.receivingTdsPerGame && player.receivingTdsPerGame > 0.2) {
-        return { market: "Receiving TDs", playerAvg: player.receivingTdsPerGame, baseline: 0.4, oppVal: oppDef.recTds, oppLabel: "rec TD DEF allows", unit: "TDs", shareAdjusted: false as const, share: null, shareLabel: null };
-      }
-    }
-    return null;
-  })();
+  // Evaluate every qualifying market and keep the strongest edge (highest
+  // score). This is the "best player, any market" approach: a WR whose
+  // Receptions edge beats a thin Receiving-Yards edge surfaces the receptions
+  // prop; an RB whose Receiving TDs beat Rushing TDs surfaces the receiving
+  // TD prop.
+  let best: PropProjection | null = null;
+  for (const candidate of buildCandidates(player, oppDef)) {
+    const proj = evaluateCandidate(player, candidate);
+    if (proj && (!best || proj.score > best.score)) best = proj;
+  }
+  return best;
+}
 
-  if (!candidate) return null;
-
+/** Score a single candidate market for a player against the opponent defense. */
+function evaluateCandidate(
+  player: NflPropCandidate,
+  candidate: PropCandidate
+): PropProjection | null {
   const reasons: string[] = [
     `${player.statsSeason} season: ${candidate.playerAvg.toFixed(1)}/game (${player.gamesPlayed} GP)`,
   ];
 
   // Matchup-aware: blend the player's average with what the opponent defense
-  // actually concedes per game when we have it. For yards markets that are
-  // spread across multiple players (receiving yards across the corps, rushing
-  // yards across the backfield), the defense's TOTAL allowance is compared
-  // against a share of it — otherwise every WR/RB would read as a huge Under
-  // and never rank.
+  // actually concedes per game when we have it. For yards/receptions markets
+  // that are spread across multiple players (receiving yards across the corps,
+  // rushing yards across the backfield, receptions across the targets), the
+  // defense's TOTAL allowance is compared against a share of it — otherwise
+  // every WR/RB would read as a huge Under and never rank.
   let blended = candidate.playerAvg;
   let margin = candidate.playerAvg - candidate.baseline;
   const oppVal = candidate.oppVal; // capture so TS narrows the union prop
+  const share = candidate.share; // capture so TS narrows the nullable prop
+  const isShare = share != null;
   const effOpp =
-    oppVal != null && oppVal > 0 && candidate.shareAdjusted
-      ? oppVal * candidate.share
+    oppVal != null && oppVal > 0 && isShare
+      ? oppVal * share
       : oppVal;
   if (effOpp != null && effOpp > 0) {
     blended = candidate.playerAvg * 0.6 + effOpp * 0.4;
     margin = candidate.playerAvg - effOpp;
     reasons.push(
-      candidate.shareAdjusted
-        ? `${candidate.oppLabel} ~${oppVal!.toFixed(0)} yds/g (${candidate.shareLabel} share ~${effOpp.toFixed(0)})`
+      isShare
+        ? `${candidate.oppLabel} ~${oppVal!.toFixed(0)} ${candidate.unit}/g (${candidate.shareLabel} share ~${effOpp.toFixed(candidate.unit === "recs" ? 1 : 0)})`
         : `${candidate.oppLabel} ~${effOpp.toFixed(candidate.unit === "TDs" ? 2 : 0)} ${candidate.unit}/g`
     );
   } else {
@@ -288,11 +341,13 @@ function projectProp(
   // Direction + score: Over when the player out-produces the specific defense
   // (or baseline), scored by how much. Under leans are mild fades ranked below
   // Over stars so they only surface when few Over props exist.
-  // NOTE: thresholds are unit-aware — yards markets move in tens, TD markets
-  // move in fractions (e.g. +0.5 TDs/g is a meaningful edge).
+  // NOTE: thresholds are unit-aware — yards move in tens, TD markets in
+  // fractions (e.g. +0.5 TDs/g is a meaningful edge), receptions in single
+  // catches (e.g. +1.0 recs/g).
   const isTd = candidate.unit === "TDs";
-  const overThreshold = isTd ? 0.3 : 10;
-  const underThreshold = isTd ? -0.4 : -15;
+  const isRecs = candidate.unit === "recs";
+  const overThreshold = isTd ? 0.3 : isRecs ? 1.0 : 10;
+  const underThreshold = isTd ? -0.4 : isRecs ? -1.5 : -15;
   let direction: "Over" | "Under";
   let score: number;
   const refVal = effOpp != null ? effOpp : candidate.baseline;
@@ -301,20 +356,22 @@ function projectProp(
   const defLabel = candidate.oppLabel.replace(/ allows$/, "");
   const refLabel =
     effOpp != null
-      ? candidate.shareAdjusted
+      ? isShare
         ? `${defLabel} ${candidate.shareLabel}-share`
         : candidate.oppLabel
       : "league baseline";
   if (margin >= overThreshold) {
     direction = "Over";
-    reasons.push(`Outpaces ${refLabel} (~${refVal.toFixed(isTd ? 2 : 0)} ${candidate.unit}/g)`);
+    reasons.push(`Outpaces ${refLabel} (~${refVal.toFixed(isTd ? 2 : isRecs ? 1 : 0)} ${candidate.unit}/g)`);
     // Score is normalized by the player's own average so smaller-yards markets
-    // (WR/TE receiving) rank fairly against QB passing yards instead of being
-    // buried by raw margin (QBs always have the biggest yardage numbers).
-    score = 10 + (margin / candidate.playerAvg) * 20;
+    // (WR/TE receiving, receptions) rank fairly against QB passing yards
+    // instead of being buried by raw margin (QBs always have the biggest
+    // yardage numbers). Capped so a marginal TD/receptions edge (fractional
+    // margins, big ratio) can't pathologically outrank a massive yards edge.
+    score = Math.min(25, 10 + (margin / candidate.playerAvg) * 20);
   } else if (margin <= underThreshold) {
     direction = "Under";
-    reasons.push(`Below ${refLabel} (~${refVal.toFixed(isTd ? 2 : 0)} ${candidate.unit}/g)`);
+    reasons.push(`Below ${refLabel} (~${refVal.toFixed(isTd ? 2 : isRecs ? 1 : 0)} ${candidate.unit}/g)`);
     // Cap Under fades below the Over floor (10) so a mild fade on a low-avg
     // market (e.g. a 0.5 TDs/g RB) can never outrank a genuine Over star.
     score = Math.min(7, (-margin / candidate.playerAvg) * 10);
@@ -357,6 +414,7 @@ export function analyzeNflProps(games: NflGame[]): NflPropPick[] {
         rushTds: side === "away" ? game.homeDefRushTds : game.awayDefRushTds,
         recTds: side === "away" ? game.homeDefRecTds : game.awayDefRecTds,
         recYds: side === "away" ? game.homeDefRecYds : game.awayDefRecYds,
+        recRecs: side === "away" ? game.homeDefRecRecs : game.awayDefRecRecs,
       };
 
       for (const player of candidates) {

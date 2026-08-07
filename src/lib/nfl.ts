@@ -189,6 +189,8 @@ export interface PlayerSeasonStats {
   receivingYardsPerGame: number | null;
   receivingTds: number | null;
   receptions: number | null;
+  /** Receptions per game (derived from `receptions` / gamesPlayed). */
+  receptionsPerGame: number | null;
 }
 
 /**
@@ -218,6 +220,7 @@ export async function fetchNflPlayerStats(
     const passingTds = find("passing", "passingTouchdowns");
     const rushingTds = find("rushing", "rushingTouchdowns");
     const receivingTds = find("receiving", "receivingTouchdowns");
+    const receptions = find("receiving", "receptions");
 
     return {
       gamesPlayed,
@@ -227,7 +230,8 @@ export async function fetchNflPlayerStats(
       rushingTds: rushingTds != null && gamesPlayed > 0 ? rushingTds / gamesPlayed : null,
       receivingYardsPerGame: find("receiving", "receivingYardsPerGame"),
       receivingTds: receivingTds != null && gamesPlayed > 0 ? receivingTds / gamesPlayed : null,
-      receptions: find("receiving", "receptions"),
+      receptions,
+      receptionsPerGame: receptions != null && gamesPlayed > 0 ? receptions / gamesPlayed : null,
     };
   } catch {
     return null;
@@ -248,6 +252,8 @@ export interface TeamSeasonStats {
   recTdsAllowedPerGame: number | null;
   /** Receiving yards this defense allows per game (for WR/TE receiving props). */
   recYdsAllowedPerGame: number | null;
+  /** Receptions this defense allows per game (for WR/TE/RB receptions props). */
+  recRecsAllowedPerGame: number | null;
 }
 
 /**
@@ -297,6 +303,7 @@ export async function fetchNflTeamStats(
       rushTdsAllowedPerGame: opp("rushing", "rushingTouchdowns"),
       recTdsAllowedPerGame: opp("receiving", "receivingTouchdowns"),
       recYdsAllowedPerGame: opp("receiving", "receivingYards"),
+      recRecsAllowedPerGame: opp("receiving", "receptions"),
     };
   } catch {
     return null;

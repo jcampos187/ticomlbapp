@@ -13,6 +13,7 @@ export interface NflPropCandidate {
   rushingTdsPerGame: number | null;
   receivingYardsPerGame: number | null;
   receivingTdsPerGame: number | null;
+  receptionsPerGame: number | null;
 }
 
 export interface NflGame {
@@ -48,12 +49,14 @@ export interface NflGame {
   awayDefRushTds: number | null;
   awayDefRecTds: number | null;
   awayDefRecYds: number | null;
+  awayDefRecRecs: number | null;
   homeDefPassYds: number | null;
   homeDefRushYds: number | null;
   homeDefPassTds: number | null;
   homeDefRushTds: number | null;
   homeDefRecTds: number | null;
   homeDefRecYds: number | null;
+  homeDefRecRecs: number | null;
   // Prop candidates for each side
   awayProps: NflPropCandidate[];
   homeProps: NflPropCandidate[];

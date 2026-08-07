@@ -66,7 +66,7 @@ export async function GET(request: Request) {
       for (const p of players) {
         statTargets.push({
           teamId: id,
-          player: { playerId: p.id, name: p.name, position: p.position, teamAbbrev: "", statsSeason: 0, gamesPlayed: 0, passingYardsPerGame: null, passingTdsPerGame: null, rushingYardsPerGame: null, rushingTdsPerGame: null, receivingYardsPerGame: null, receivingTdsPerGame: null },
+          player: { playerId: p.id, name: p.name, position: p.position, teamAbbrev: "", statsSeason: 0, gamesPlayed: 0, passingYardsPerGame: null, passingTdsPerGame: null, rushingYardsPerGame: null, rushingTdsPerGame: null, receivingYardsPerGame: null, receivingTdsPerGame: null, receptionsPerGame: null },
         });
       }
       if (statTargets.length >= MAX_PLAYER_STATS) break;
@@ -126,6 +126,7 @@ export async function GET(request: Request) {
               rushingTdsPerGame: stat?.rushingTds ?? null,
               receivingYardsPerGame: stat?.receivingYardsPerGame ?? null,
               receivingTdsPerGame: stat?.receivingTds ?? null,
+              receptionsPerGame: stat?.receptionsPerGame ?? null,
             };
           });
       };
@@ -159,12 +160,14 @@ export async function GET(request: Request) {
         awayDefRushTds: awayStats?.rushTdsAllowedPerGame ?? null,
         awayDefRecTds: awayStats?.recTdsAllowedPerGame ?? null,
         awayDefRecYds: awayStats?.recYdsAllowedPerGame ?? null,
+        awayDefRecRecs: awayStats?.recRecsAllowedPerGame ?? null,
         homeDefPassYds: homeStats?.passYdsAllowedPerGame ?? null,
         homeDefRushYds: homeStats?.rushYdsAllowedPerGame ?? null,
         homeDefPassTds: homeStats?.passTdsAllowedPerGame ?? null,
         homeDefRushTds: homeStats?.rushTdsAllowedPerGame ?? null,
         homeDefRecTds: homeStats?.recTdsAllowedPerGame ?? null,
         homeDefRecYds: homeStats?.recYdsAllowedPerGame ?? null,
+        homeDefRecRecs: homeStats?.recRecsAllowedPerGame ?? null,
         awayProps: buildProps(game.awayTeamId, game.awayAbbrev),
         homeProps: buildProps(game.homeTeamId, game.homeAbbrev),
       });

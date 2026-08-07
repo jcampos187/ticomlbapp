@@ -332,6 +332,11 @@ export function NflDashboard() {
   const [data, setData] = useState<NflAnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [propFilter, setPropFilter] = useState<"All" | "QB" | "RB" | "WR" | "TE">("All");
+
+  // Reset the position filter to "All" whenever the dashboard mounts (tab
+  // switch) so a stale WR/TE filter never hides props on a fresh visit.
+  useEffect(() => { setPropFilter("All"); }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -440,9 +445,31 @@ export function NflDashboard() {
       {data.topProps.length > 0 && (
         <section>
           <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🔥 Top Projected Props</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {data.topProps.map((prop, i) => <PropCard key={i} prop={prop} index={i} />)}
+          {/* Position filter */}
+          <div className="flex flex-wrap items-center gap-2 mb-4">
+            <span className="text-xs text-muted">Filter:</span>
+            {(["All", "QB", "RB", "WR", "TE"] as const).map(pos => (
+              <button
+                key={pos}
+                onClick={() => setPropFilter(pos)}
+                className={`px-3 py-1 rounded-full text-xs font-medium transition ${
+                  propFilter === pos
+                    ? "bg-green-600 text-white"
+                    : "bg-slate-700/60 text-muted hover:bg-slate-700 hover:text-slate-200"
+                }`}
+              >
+                {pos === "All" ? "All" : pos}
+              </button>
+            ))}
           </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {data.topProps
+              .filter(p => propFilter === "All" || p.position === propFilter)
+              .map((prop, i) => <PropCard key={i} prop={prop} index={i} />)}
+          </div>
+          {data.topProps.filter(p => propFilter === "All" || p.position === propFilter).length === 0 && (
+            <p className="text-sm text-muted">No {propFilter} props qualified this week.</p>
+          )}
         </section>
       )}
 
