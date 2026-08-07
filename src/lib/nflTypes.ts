@@ -44,8 +44,14 @@ export interface NflGame {
   // (from the site API's `results.opponent` split). Used for prop projections.
   awayDefPassYds: number | null;
   awayDefRushYds: number | null;
+  awayDefPassTds: number | null;
+  awayDefRushTds: number | null;
+  awayDefRecTds: number | null;
   homeDefPassYds: number | null;
   homeDefRushYds: number | null;
+  homeDefPassTds: number | null;
+  homeDefRushTds: number | null;
+  homeDefRecTds: number | null;
   // Prop candidates for each side
   awayProps: NflPropCandidate[];
   homeProps: NflPropCandidate[];
@@ -83,6 +89,8 @@ export interface NflPropPick {
   market: string; // e.g. "Passing Yards"
   projectedLine: number;
   direction: "Over" | "Under";
+  /** Matchup quality for the badge: easy (weak DEF) / tough (stingy DEF). */
+  matchup: "easy" | "tough";
   playerAvg: number | null;
   statsSeason: number;
   reasons: string[];

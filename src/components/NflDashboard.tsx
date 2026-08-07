@@ -241,6 +241,14 @@ function TotalCard({ total, index }: { total: NflAnalysisResult["topTotals"][0];
 
 function PropCard({ prop, index }: { prop: NflAnalysisResult["topProps"][0]; index: number }) {
   const isOver = prop.direction === "Over";
+  // Matchup badge: green = player clears this defense, red = stingy matchup.
+  const matchupBadge =
+    prop.matchup === "easy" ? (
+      <span className="text-xs bg-green-500/15 text-green-400 px-2 py-0.5 rounded-full font-medium">🟢 Easy matchup</span>
+    ) : (
+      <span className="text-xs bg-red-500/15 text-red-400 px-2 py-0.5 rounded-full font-medium">🔴 Tough matchup</span>
+    );
+
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 100}ms` }}>
       <div className="flex items-start justify-between mb-2">
@@ -253,10 +261,11 @@ function PropCard({ prop, index }: { prop: NflAnalysisResult["topProps"][0]; ind
           <div className="text-lg font-bold">{prop.projectedLine.toFixed(1)}</div>
         </div>
       </div>
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex flex-wrap items-center gap-2 mb-2">
         <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${isOver ? "bg-green-500/20 text-green-400" : "bg-yellow-500/20 text-yellow-400"}`}>
           {prop.direction} {prop.market}
         </span>
+        {matchupBadge}
         <span className="text-xs text-muted">(projection — not a book line)</span>
       </div>
       <div className="flex flex-wrap gap-1">

@@ -242,6 +242,10 @@ export interface TeamSeasonStats {
    * `defensive.yardsAllowed` is hardcoded 0). */
   passYdsAllowedPerGame: number | null;
   rushYdsAllowedPerGame: number | null;
+  /** TDs the defense allows per game, by scoring type. */
+  passTdsAllowedPerGame: number | null;
+  rushTdsAllowedPerGame: number | null;
+  recTdsAllowedPerGame: number | null;
 }
 
 /**
@@ -287,6 +291,9 @@ export async function fetchNflTeamStats(
       pointsPerGame: own("scoring", "totalPointsPerGame"),
       passYdsAllowedPerGame: opp("passing", "netPassingYards"),
       rushYdsAllowedPerGame: opp("rushing", "rushingYards"),
+      passTdsAllowedPerGame: opp("passing", "passingTouchdowns"),
+      rushTdsAllowedPerGame: opp("rushing", "rushingTouchdowns"),
+      recTdsAllowedPerGame: opp("receiving", "receivingTouchdowns"),
     };
   } catch {
     return null;
