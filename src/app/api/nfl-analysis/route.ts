@@ -158,11 +158,13 @@ export async function GET(request: Request) {
         awayDefPassTds: awayStats?.passTdsAllowedPerGame ?? null,
         awayDefRushTds: awayStats?.rushTdsAllowedPerGame ?? null,
         awayDefRecTds: awayStats?.recTdsAllowedPerGame ?? null,
+        awayDefRecYds: awayStats?.recYdsAllowedPerGame ?? null,
         homeDefPassYds: homeStats?.passYdsAllowedPerGame ?? null,
         homeDefRushYds: homeStats?.rushYdsAllowedPerGame ?? null,
         homeDefPassTds: homeStats?.passTdsAllowedPerGame ?? null,
         homeDefRushTds: homeStats?.rushTdsAllowedPerGame ?? null,
         homeDefRecTds: homeStats?.recTdsAllowedPerGame ?? null,
+        homeDefRecYds: homeStats?.recYdsAllowedPerGame ?? null,
         awayProps: buildProps(game.awayTeamId, game.awayAbbrev),
         homeProps: buildProps(game.homeTeamId, game.homeAbbrev),
       });

@@ -246,6 +246,8 @@ export interface TeamSeasonStats {
   passTdsAllowedPerGame: number | null;
   rushTdsAllowedPerGame: number | null;
   recTdsAllowedPerGame: number | null;
+  /** Receiving yards this defense allows per game (for WR/TE receiving props). */
+  recYdsAllowedPerGame: number | null;
 }
 
 /**
@@ -294,6 +296,7 @@ export async function fetchNflTeamStats(
       passTdsAllowedPerGame: opp("passing", "passingTouchdowns"),
       rushTdsAllowedPerGame: opp("rushing", "rushingTouchdowns"),
       recTdsAllowedPerGame: opp("receiving", "receivingTouchdowns"),
+      recYdsAllowedPerGame: opp("receiving", "receivingYards"),
     };
   } catch {
     return null;

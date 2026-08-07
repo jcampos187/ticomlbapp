@@ -47,11 +47,13 @@ export interface NflGame {
   awayDefPassTds: number | null;
   awayDefRushTds: number | null;
   awayDefRecTds: number | null;
+  awayDefRecYds: number | null;
   homeDefPassYds: number | null;
   homeDefRushYds: number | null;
   homeDefPassTds: number | null;
   homeDefRushTds: number | null;
   homeDefRecTds: number | null;
+  homeDefRecYds: number | null;
   // Prop candidates for each side
   awayProps: NflPropCandidate[];
   homeProps: NflPropCandidate[];
