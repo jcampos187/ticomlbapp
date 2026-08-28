@@ -5,6 +5,7 @@ import type { AnalysisResult } from "@/lib/types";
 import { formatOdds } from "@/lib/analysis";
 import { GameTime } from "@/components/GameTime";
 import { NflDashboard } from "@/components/NflDashboard";
+import { CfbDashboard } from "@/components/CfbDashboard";
 
 /** Local YYYY-MM-DD computed in the viewer's own timezone. */
 function localDateStr(d: Date = new Date()): string {
@@ -53,6 +54,75 @@ function KBar({ k9 }: { k9: number | null }) {
     <div className="w-full bg-slate-700 rounded-full h-1.5 mt-1">
       <div className={`${color} h-1.5 rounded-full`} style={{ width: `${pct}%` }} />
     </div>
+  );
+}
+
+/** Compute the moneyline movement for the favorite side. Returns null if no movement data. */
+function mlMovement(game: AnalysisResult["games"][0]): { open: number; current: number; move: number; favTeam: string } | null {
+  if (!game.awayML || !game.homeML) return null;
+  if (game.awayMLOpen == null || game.homeMLOpen == null) return null;
+  const favIsAway = game.awayML < 0;
+  const open = favIsAway ? game.awayMLOpen : game.homeMLOpen;
+  const current = favIsAway ? game.awayML : game.homeML;
+  if (!open || !current) return null;
+  const move = current - open; // negative = line moved toward the favorite
+  const favTeam = favIsAway ? game.awayTeam : game.homeTeam;
+  return { open, current, move, favTeam };
+}
+
+function MlbLineMovementAlerts({ games }: { games: AnalysisResult["games"] }) {
+  const alerts = games
+    .filter(g => g.status !== "final")
+    .map(g => ({ game: g, movement: mlMovement(g) }))
+    .filter((a): a is { game: AnalysisResult["games"][0]; movement: NonNullable<ReturnType<typeof mlMovement>> } =>
+      a.movement != null && Math.abs(a.movement.move) >= 30
+    )
+    .sort((a, b) => Math.abs(b.movement.move) - Math.abs(a.movement.move));
+
+  if (alerts.length === 0) return null;
+
+  return (
+    <section>
+      <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+        🔔 Line Movement Alerts
+        <span className="text-xs text-muted font-normal">(ML moved 30+ cents)</span>
+      </h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {alerts.map(({ game, movement }, i) => {
+          const movedTowardFav = movement.move < 0;
+          const arrow = movedTowardFav ? "▼" : "▲";
+          const color = movedTowardFav ? "text-green-400" : "text-red-400";
+          const label = movedTowardFav ? "Sharp money" : "Money moving away";
+          const absMove = Math.abs(movement.move);
+          const severity = absMove >= 60 ? "border-red-500" : absMove >= 45 ? "border-amber-500" : "border-yellow-500";
+          return (
+            <div
+              key={game.id}
+              className={`glass rounded-xl p-4 card-hover animate-in border-l-4 ${severity}`}
+              style={{ animationDelay: `${i * 60}ms` }}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full font-medium">⚡ {absMove}¢ move</span>
+                <span className={`text-xs font-bold ${color}`}>{arrow} {label}</span>
+              </div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="font-bold text-sm">{movement.favTeam}</span>
+                <span className="text-xs text-muted">Favorite</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-muted">
+                  {game.awayAbbrev} @ {game.homeAbbrev}
+                </span>
+                <span className="text-sm font-mono">
+                  <span className="text-muted line-through mr-1">{formatOdds(movement.open)}</span>
+                  <span className="text-white">→ {formatOdds(movement.current)}</span>
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -320,7 +390,7 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
-function SportTabs({ sport, onChange }: { sport: "mlb" | "nfl"; onChange: (s: "mlb" | "nfl") => void }) {
+function SportTabs({ sport, onChange }: { sport: "mlb" | "nfl" | "cfb"; onChange: (s: "mlb" | "nfl" | "cfb") => void }) {
   return (
     <div className="flex justify-center mb-8 animate-in">
       <div className="inline-flex glass rounded-xl p-1 gap-1">
@@ -336,6 +406,12 @@ function SportTabs({ sport, onChange }: { sport: "mlb" | "nfl"; onChange: (s: "m
         >
           🏈 NFL
         </button>
+        <button
+          onClick={() => onChange("cfb")}
+          className={`px-6 py-2 rounded-lg text-sm font-semibold transition ${sport === "cfb" ? "bg-orange-600 text-white shadow" : "text-muted hover:text-white"}`}
+        >
+          🏈 CFB
+        </button>
       </div>
     </div>
   );
@@ -345,14 +421,14 @@ export default function Home() {
   // Server always renders MLB first; the saved tab is restored after hydration
   // so the server/client markup matches (avoids React hydration errors from
   // reading localStorage during the initial render).
-  const [sport, setSport] = useState<"mlb" | "nfl">("mlb");
+  const [sport, setSport] = useState<"mlb" | "nfl" | "cfb">("mlb");
 
   useEffect(() => {
     const saved = localStorage.getItem("ticomlbapp-sport");
-    if (saved === "nfl" || saved === "mlb") setSport(saved);
+    if (saved === "nfl" || saved === "mlb" || saved === "cfb") setSport(saved);
   }, []);
 
-  const changeSport = (s: "mlb" | "nfl") => {
+  const changeSport = (s: "mlb" | "nfl" | "cfb") => {
     setSport(s);
     localStorage.setItem("ticomlbapp-sport", s);
   };
@@ -360,7 +436,7 @@ export default function Home() {
   return (
     <>
       <SportTabs sport={sport} onChange={changeSport} />
-      {sport === "mlb" ? <MlbDashboard /> : <NflDashboard />}
+      {sport === "mlb" ? <MlbDashboard /> : sport === "nfl" ? <NflDashboard /> : <CfbDashboard />}
     </>
   );
 }
@@ -438,6 +514,9 @@ function MlbDashboard() {
           ))}
         </div>
       </section>
+
+      {/* Line Movement Alerts */}
+      <MlbLineMovementAlerts games={data.games} />
 
       {/* Top Picks */}
       {data.topPicks.length > 0 && (

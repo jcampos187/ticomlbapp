@@ -1,44 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { NflAnalysisResult } from "@/lib/nflTypes";
+import type { CfbAnalysisResult } from "@/lib/cfbTypes";
 import { formatOdds } from "@/lib/analysis";
 import { GameTime } from "@/components/GameTime";
 
-function localDateStr(d: Date = new Date()): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-/** Group games by local calendar day, ordered by kickoff time. */
-function groupByDay(games: NflAnalysisResult["games"]): { day: string; label: string; games: NflAnalysisResult["games"] }[] {
-  const groups = new Map<string, NflAnalysisResult["games"]>();
-  const sorted = [...games].sort((a, b) => a.startTime.localeCompare(b.startTime));
-
-  for (const game of sorted) {
-    const d = new Date(game.startTime);
-    if (Number.isNaN(d.getTime())) continue;
-    const key = localDateStr(d);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(game);
-  }
-
-  return [...groups.entries()].map(([day, games]) => ({
-    day,
-    label: new Date(`${day}T12:00:00`).toLocaleDateString([], {
-      weekday: "long",
-      month: "short",
-      day: "numeric",
-    }),
-    games,
-  }));
-}
-
 function OddsDisplay({ odds }: { odds: number }) {
   if (!odds) return <span className="text-muted">—</span>;
-  const cls = odds > 0 ? "odds-positive" : "odds-negative";
+  const cls = odds > 0 ? "odds-positive" : odds < 0 ? "odds-negative" : "";
   return <span className={`font-bold ${cls}`}>{formatOdds(odds)}</span>;
 }
 
@@ -63,7 +32,7 @@ function LineMove({ current, open }: { current: number; open: number | null }) {
 function SpreadMove({ current, open }: { current: number | null; open: number | null }) {
   if (current == null || open == null) return null;
   const move = current - open;
-  if (Math.abs(move) < 0.75) return null;
+  if (Math.abs(move) < 1) return null;
   const cls = move < 0 ? "text-green-400" : "text-red-400";
   const arrow = move < 0 ? "▼" : "▲";
   return (
@@ -73,24 +42,53 @@ function SpreadMove({ current, open }: { current: number | null; open: number | 
   );
 }
 
+/** Group games by local calendar day, ordered by start time. */
+function groupByDay(games: CfbAnalysisResult["games"]): { day: string; label: string; games: CfbAnalysisResult["games"] }[] {
+  const groups = new Map<string, CfbAnalysisResult["games"]>();
+  const sorted = [...games].sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+  for (const game of sorted) {
+    const d = new Date(game.startTime);
+    if (Number.isNaN(d.getTime())) continue;
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    const key = `${y}-${m}-${day}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(game);
+  }
+
+  return [...groups.entries()].map(([day, games]) => ({
+    day,
+    label: new Date(`${day}T12:00:00`).toLocaleDateString([], {
+      weekday: "long",
+      month: "short",
+      day: "numeric",
+    }),
+    games,
+  }));
+}
+
 /** Compute the spread movement for the favorite side. Returns null if no movement data. */
-function spreadMovement(game: NflAnalysisResult["games"][0]): { open: number; current: number; move: number; favTeam: string } | null {
+function spreadMovement(game: CfbAnalysisResult["games"][0]): { open: number; current: number; move: number; favTeam: string; favSide: "away" | "home" } | null {
   if (game.awaySpread == null || game.homeSpread == null) return null;
   if (game.awaySpreadOpen == null || game.homeSpreadOpen == null) return null;
+  // The favorite is the side with the more-negative spread.
   const favIsAway = game.awaySpread < game.homeSpread;
   const open = favIsAway ? game.awaySpreadOpen : game.homeSpreadOpen;
   const current = favIsAway ? game.awaySpread : game.homeSpread;
   if (open == null || current == null) return null;
-  const move = current - open;
+  const move = current - open; // negative = line moved toward the favorite
   const favTeam = favIsAway ? game.awayTeam : game.homeTeam;
-  return { open, current, move, favTeam };
+  const favSide = favIsAway ? "away" : "home";
+  return { open, current, move, favTeam, favSide };
 }
 
-function LineMovementAlerts({ games }: { games: NflAnalysisResult["games"] }) {
+function LineMovementAlerts({ games }: { games: CfbAnalysisResult["games"] }) {
   const alerts = games
     .filter(g => g.status !== "final")
     .map(g => ({ game: g, movement: spreadMovement(g) }))
-    .filter((a): a is { game: NflAnalysisResult["games"][0]; movement: NonNullable<ReturnType<typeof spreadMovement>> } =>
+    .filter((a): a is { game: CfbAnalysisResult["games"][0]; movement: NonNullable<ReturnType<typeof spreadMovement>> } =>
       a.movement != null && Math.abs(a.movement.move) >= 3
     )
     .sort((a, b) => Math.abs(b.movement.move) - Math.abs(a.movement.move));
@@ -105,7 +103,7 @@ function LineMovementAlerts({ games }: { games: NflAnalysisResult["games"] }) {
       </h2>
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {alerts.map(({ game, movement }, i) => {
-          const movedTowardFav = movement.move < 0;
+          const movedTowardFav = movement.move < 0; // more negative = sharper on fav
           const arrow = movedTowardFav ? "▼" : "▲";
           const color = movedTowardFav ? "text-green-400" : "text-red-400";
           const label = movedTowardFav ? "Sharp money" : "Money moving away";
@@ -142,7 +140,7 @@ function LineMovementAlerts({ games }: { games: NflAnalysisResult["games"] }) {
   );
 }
 
-function NflGameCard({ game, index }: { game: NflAnalysisResult["games"][0]; index: number }) {
+function CfbGameCard({ game, index }: { game: CfbAnalysisResult["games"][0]; index: number }) {
   const [showDetails, setShowDetails] = useState(false);
   const statusBadge =
     game.status === "live" ? (
@@ -217,39 +215,28 @@ function NflGameCard({ game, index }: { game: NflAnalysisResult["games"][0]; ind
         </div>
       </div>
 
-      {/* Expandable details: spread line + projected prop candidates */}
+      {/* Expandable details */}
       {showDetails && (
         <div className="mt-3 pt-3 border-t border-slate-700 space-y-2 animate-in">
           {game.details && (
             <div className="text-xs text-muted">
-              Spread: <b className="text-slate-200">{game.details}</b> · Total:{" "}
-              <b className="text-slate-200">{game.overUnder.toFixed(1)}</b>
+              Spread: <b className="text-slate-200">{game.details}</b>
+              {game.overUnder > 0 && (
+                <> · Total: <b className="text-slate-200">{game.overUnder.toFixed(1)}</b></>
+              )}
             </div>
           )}
-          {game.awayProps.length + game.homeProps.length > 0 && (
-            <>
-              <div className="text-xs font-semibold text-muted mb-1">Projected Props (statistical)</div>
-              {[...game.awayProps, ...game.homeProps].slice(0, 4).map((p, i) => (
-                <div key={i} className="flex items-center justify-between text-xs">
-                  <span>
-                    <b>{p.name}</b> ({p.position} · {p.teamAbbrev})
-                  </span>
-                  <span className="text-muted">
-                    {p.passingYardsPerGame != null && `${p.passingYardsPerGame.toFixed(1)} pass yds/g`}
-                    {p.rushingYardsPerGame != null && `${p.rushingYardsPerGame.toFixed(1)} rush yds/g`}
-                    {p.receivingYardsPerGame != null && `${p.receivingYardsPerGame.toFixed(1)} rec yds/g`}
-                  </span>
-                </div>
-              ))}
-            </>
-          )}
+          <div className="flex gap-4 text-xs text-muted">
+            {game.awayPpg != null && <span>{game.awayAbbrev} PPG: <b className="text-slate-200">{game.awayPpg.toFixed(1)}</b></span>}
+            {game.homePpg != null && <span>{game.homeAbbrev} PPG: <b className="text-slate-200">{game.homePpg.toFixed(1)}</b></span>}
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function NflPickCard({ pick, index }: { pick: NflAnalysisResult["topPicks"][0]; index: number }) {
+function CfbPickCard({ pick, index }: { pick: CfbAnalysisResult["topPicks"][0]; index: number }) {
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 80}ms` }}>
       <div className="flex items-center justify-between mb-2">
@@ -270,7 +257,7 @@ function NflPickCard({ pick, index }: { pick: NflAnalysisResult["topPicks"][0]; 
   );
 }
 
-function AtsCard({ pick, index }: { pick: NflAnalysisResult["topAts"][0]; index: number }) {
+function AtsCard({ pick, index }: { pick: CfbAnalysisResult["topAts"][0]; index: number }) {
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 80}ms` }}>
       <div className="flex items-center justify-between mb-2">
@@ -288,7 +275,7 @@ function AtsCard({ pick, index }: { pick: NflAnalysisResult["topAts"][0]; index:
   );
 }
 
-function TotalCard({ total, index }: { total: NflAnalysisResult["topTotals"][0]; index: number }) {
+function TotalCard({ total, index }: { total: CfbAnalysisResult["topTotals"][0]; index: number }) {
   const isOver = total.pick === "Over";
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 90}ms` }}>
@@ -308,45 +295,7 @@ function TotalCard({ total, index }: { total: NflAnalysisResult["topTotals"][0];
   );
 }
 
-function PropCard({ prop, index }: { prop: NflAnalysisResult["topProps"][0]; index: number }) {
-  const isOver = prop.direction === "Over";
-  // Matchup badge: green = player clears this defense, red = stingy matchup.
-  const matchupBadge =
-    prop.matchup === "easy" ? (
-      <span className="text-xs bg-green-500/15 text-green-400 px-2 py-0.5 rounded-full font-medium">🟢 Easy matchup</span>
-    ) : (
-      <span className="text-xs bg-red-500/15 text-red-400 px-2 py-0.5 rounded-full font-medium">🔴 Tough matchup</span>
-    );
-
-  return (
-    <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 100}ms` }}>
-      <div className="flex items-start justify-between mb-2">
-        <div>
-          <div className="font-bold">{prop.player} <span className="text-xs text-muted font-normal">({prop.position} · {prop.team})</span></div>
-          <div className="text-xs text-muted">vs {prop.opponent}</div>
-        </div>
-        <div className="text-right">
-          <div className="text-xs text-muted">Projected line</div>
-          <div className="text-lg font-bold">{prop.projectedLine.toFixed(1)}</div>
-        </div>
-      </div>
-      <div className="flex flex-wrap items-center gap-2 mb-2">
-        <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${isOver ? "bg-green-500/20 text-green-400" : "bg-yellow-500/20 text-yellow-400"}`}>
-          {prop.direction} {prop.market}
-        </span>
-        {matchupBadge}
-        <span className="text-xs text-muted">(projection — not a book line)</span>
-      </div>
-      <div className="flex flex-wrap gap-1">
-        {prop.reasons.map((r, i) => (
-          <span key={i} className="text-xs bg-green-500/10 text-green-400 px-2 py-0.5 rounded-full">{r}</span>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function ParlayCard({ parlay, index }: { parlay: NflAnalysisResult["parlays"][0]; index: number }) {
+function ParlayCard({ parlay, index }: { parlay: CfbAnalysisResult["parlays"][0]; index: number }) {
   return (
     <div className="glass rounded-xl p-5 card-hover animate-in border-l-4 border-l-green-500" style={{ animationDelay: `${index * 120}ms` }}>
       <div className="flex items-center justify-between mb-3">
@@ -375,8 +324,8 @@ function ParlayCard({ parlay, index }: { parlay: NflAnalysisResult["parlays"][0]
 function LoadingState() {
   return (
     <div className="flex flex-col items-center justify-center py-20 animate-in">
-      <div className="w-12 h-12 border-4 border-green-500/20 border-t-green-500 rounded-full animate-spin mb-4" />
-      <p className="text-muted animate-pulse">Fetching this week's NFL data...</p>
+      <div className="w-12 h-12 border-4 border-orange-500/20 border-t-orange-500 rounded-full animate-spin mb-4" />
+      <p className="text-muted animate-pulse">Fetching this week's CFB data...</p>
     </div>
   );
 }
@@ -385,11 +334,11 @@ function ErrorState({ message }: { message: string }) {
   return (
     <div className="glass rounded-xl p-8 text-center animate-in">
       <div className="text-4xl mb-3">⚠️</div>
-      <h2 className="text-xl font-bold mb-2">NFL Analysis Unavailable</h2>
+      <h2 className="text-xl font-bold mb-2">CFB Analysis Unavailable</h2>
       <p className="text-muted mb-4">{message}</p>
       <button
         onClick={() => window.location.reload()}
-        className="bg-green-600 hover:bg-green-700 text-white px-6 py-2 rounded-lg transition"
+        className="bg-orange-600 hover:bg-orange-700 text-white px-6 py-2 rounded-lg transition"
       >
         Try Again
       </button>
@@ -397,21 +346,16 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
-export function NflDashboard() {
-  const [data, setData] = useState<NflAnalysisResult | null>(null);
+export function CfbDashboard() {
+  const [data, setData] = useState<CfbAnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [propFilter, setPropFilter] = useState<"All" | "QB" | "RB" | "WR" | "TE">("All");
-
-  // Reset the position filter to "All" whenever the dashboard mounts (tab
-  // switch) so a stale WR/TE filter never hides props on a fresh visit.
-  useEffect(() => { setPropFilter("All"); }, []);
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    fetch("/api/nfl-analysis")
+    fetch("/api/cfb-analysis")
       .then(async r => {
         const body = await r.json().catch(() => null);
         if (!r.ok) throw new Error(body?.message || body?.error || `HTTP ${r.status}`);
@@ -430,7 +374,6 @@ export function NflDashboard() {
   if (error) return <ErrorState message={error} />;
   if (!data) return <ErrorState message="No data returned." />;
 
-  const isPreseason = data.seasonType === 1;
   const isOffseason = data.games.length === 0;
   const dayGroups = groupByDay(data.games);
 
@@ -438,12 +381,12 @@ export function NflDashboard() {
     <div className="space-y-8">
       {/* Header */}
       <div className="text-center mb-8 animate-in">
-        <div className="inline-flex items-center gap-2 bg-green-500/10 text-green-400 text-xs px-3 py-1 rounded-full mb-3">
-          <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+        <div className="inline-flex items-center gap-2 bg-orange-500/10 text-orange-400 text-xs px-3 py-1 rounded-full mb-3">
+          <span className="w-2 h-2 bg-orange-400 rounded-full animate-pulse" />
           {data.weekLabel}
         </div>
-        <h1 className="text-3xl md:text-4xl font-bold mb-2">🏈 NFL Betting Analyzer</h1>
-        <p className="text-muted">Moneyline · Spread · Over/Under · Projected props · Parlays</p>
+        <h1 className="text-3xl md:text-4xl font-bold mb-2">🏈 College Football Analyzer</h1>
+        <p className="text-muted">Moneyline · Spread · Over/Under · Parlays</p>
       </div>
 
       {/* Week banner */}
@@ -451,17 +394,11 @@ export function NflDashboard() {
         {data.weekLabel} · {data.seasonYear} season · {data.games.length} games · Updated every 5 min
       </div>
 
-      {isPreseason && data.games.length > 0 && (
-        <div className="glass rounded-xl p-3 text-center text-sm bg-amber-500/10 text-amber-400">
-          ⚠️ Preseason — most games have no odds posted yet. Full analysis activates in the regular season.
-        </div>
-      )}
-
       {isOffseason && (
         <div className="glass rounded-xl p-10 text-center animate-in">
           <div className="text-4xl mb-3">🗓️</div>
-          <h2 className="text-xl font-bold mb-2">No NFL games this week</h2>
-          <p className="text-muted">The NFL season is in the off-season. Check back when games resume.</p>
+          <h2 className="text-xl font-bold mb-2">No CFB games this week</h2>
+          <p className="text-muted">The college football season hasn't started yet. Check back when games resume.</p>
         </div>
       )}
 
@@ -474,7 +411,7 @@ export function NflDashboard() {
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {group.games.map((game, i) => (
-              <NflGameCard key={game.id} game={game} index={i} />
+              <CfbGameCard key={game.id} game={game} index={i} />
             ))}
           </div>
         </section>
@@ -488,7 +425,7 @@ export function NflDashboard() {
         <section>
           <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks</h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {data.topPicks.map((pick, i) => <NflPickCard key={i} pick={pick} index={i} />)}
+            {data.topPicks.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
           </div>
         </section>
       )}
@@ -513,38 +450,6 @@ export function NflDashboard() {
         </section>
       )}
 
-      {/* Projected Props */}
-      {data.topProps.length > 0 && (
-        <section>
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🔥 Top Projected Props</h2>
-          {/* Position filter */}
-          <div className="flex flex-wrap items-center gap-2 mb-4">
-            <span className="text-xs text-muted">Filter:</span>
-            {(["All", "QB", "RB", "WR", "TE"] as const).map(pos => (
-              <button
-                key={pos}
-                onClick={() => setPropFilter(pos)}
-                className={`px-3 py-1 rounded-full text-xs font-medium transition ${
-                  propFilter === pos
-                    ? "bg-green-600 text-white"
-                    : "bg-slate-700/60 text-muted hover:bg-slate-700 hover:text-slate-200"
-                }`}
-              >
-                {pos === "All" ? "All" : pos}
-              </button>
-            ))}
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {data.topProps
-              .filter(p => propFilter === "All" || p.position === propFilter)
-              .map((prop, i) => <PropCard key={i} prop={prop} index={i} />)}
-          </div>
-          {data.topProps.filter(p => propFilter === "All" || p.position === propFilter).length === 0 && (
-            <p className="text-sm text-muted">No {propFilter} props qualified this week.</p>
-          )}
-        </section>
-      )}
-
       {/* Parlays */}
       {data.parlays.length > 0 && (
         <section>
@@ -557,7 +462,7 @@ export function NflDashboard() {
 
       {/* Footer */}
       <div className="text-center text-xs text-muted pt-8 pb-4 border-t border-slate-800">
-        <p>Data sourced from ESPN (free) · Prop lines are statistical projections, not sportsbook lines · Not financial advice · Gamble responsibly</p>
+        <p>Data sourced from ESPN (free) · Not financial advice · Gamble responsibly</p>
       </div>
     </div>
   );
