@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { fetchScoreboard, fetchGameOdds, TEAM_MAP } from "@/lib/espn";
-import { fetchTodaysPitchers, fetchPitcherStats, fetchTeamTrends } from "@/lib/mlb";
+import { fetchTodaysPitchers, matchGameToMlbSchedule, fetchPitcherStats, fetchTeamTrends } from "@/lib/mlb";
 import { analyzeFavorites, analyzeKProps, analyzeTotals, buildParlays } from "@/lib/analysis";
 import type { Game, AnalysisResult } from "@/lib/types";
 
@@ -40,7 +40,7 @@ export async function GET(request: Request) {
     const today = requested && isValidDate(requested) ? requested : localDate();
 
     // 1. Fetch scoreboard (games + basic info) + MLB schedule (pitchers)
-    const [espnGames, teamPitchers] = await Promise.all([
+    const [espnGames, mlbScheduleGames] = await Promise.all([
       fetchScoreboard(today),
       fetchTodaysPitchers(today),
     ]);
@@ -49,17 +49,24 @@ export async function GET(request: Request) {
     const oddsPromises = espnGames.map(g => fetchGameOdds(g.id));
     const allOdds = await Promise.all(oddsPromises);
 
-    // 3. Build game objects with odds + pitcher info (keyed by team abbreviation)
+    // 3. Match ESPN games to MLB schedule games and build game objects.
+    //    Use a Set to track which MLB gamePk's have been matched so each
+    //    doubleheader game gets its own probable pitchers.
     const games: Game[] = [];
     const pitcherIds: number[] = [];
+    const usedPks = new Set<number>();
 
     for (let i = 0; i < espnGames.length; i++) {
       const eg = espnGames[i];
       const odds = allOdds[i];
 
-      // Look up pitchers by team abbreviation from MLB schedule API
-      const awayPitcher = teamPitchers[eg.awayAbbrev];
-      const homePitcher = teamPitchers[eg.homeAbbrev];
+      // Match this ESPN game to the corresponding MLB schedule game
+      const mlbGame = matchGameToMlbSchedule(
+        eg.awayAbbrev, eg.homeAbbrev, eg.startTime, mlbScheduleGames, usedPks,
+      );
+
+      const awayPitcher = mlbGame?.away ?? null;
+      const homePitcher = mlbGame?.home ?? null;
 
       const awayPitcherName = awayPitcher?.name ?? "";
       const homePitcherName = homePitcher?.name ?? "";
@@ -108,13 +115,21 @@ export async function GET(request: Request) {
     );
     const statMap = new Map(statResults.map(r => [r.id, r.stats]));
 
-    // Map stats back to games by matching team abbreviations
-    for (const game of games) {
-      const awayPitcher = teamPitchers[game.awayAbbrev];
-      const homePitcher = teamPitchers[game.homeAbbrev];
+    // Map stats back to games using the matched MLB schedule data
+    // Re-iterate to attach stats (we need to re-match since we consumed usedPks)
+    const usedPksForStats = new Set<number>();
+    for (let i = 0; i < espnGames.length; i++) {
+      const eg = espnGames[i];
+      const game = games[i];
+      const mlbGame = matchGameToMlbSchedule(
+        eg.awayAbbrev, eg.homeAbbrev, eg.startTime, mlbScheduleGames, usedPksForStats,
+      );
 
-      const awayStats = awayPitcher ? statMap.get(awayPitcher.id) : undefined;
-      const homeStats = homePitcher ? statMap.get(homePitcher.id) : undefined;
+      const awayPitcherId = mlbGame?.away?.id;
+      const homePitcherId = mlbGame?.home?.id;
+
+      const awayStats = awayPitcherId ? statMap.get(awayPitcherId) : undefined;
+      const homeStats = homePitcherId ? statMap.get(homePitcherId) : undefined;
 
       if (awayStats) {
         game.awayK9 = awayStats.k9;

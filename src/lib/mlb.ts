@@ -103,37 +103,91 @@ export async function fetchTeamTrends(teamName: string): Promise<TeamTrends> {
 }
 
 /**
- * Fetch today's MLB schedule and return pitcher info keyed by team abbreviation.
- * This is reliable because the schedule API ties pitchers to teams directly.
+ * Fetch today's MLB schedule and return pitcher info.
+ *
+ * Keys are `${gamePk}_${teamAbbrev}` so doubleheaders (two games between
+ * the same teams) don't overwrite each other. Each entry also carries the
+ * game's start time and team abbreviations so the caller can match them to
+ * ESPN scoreboard games.
  */
-export async function fetchTodaysPitchers(date: string): Promise<Record<string, PitcherInfo>> {
+export interface PitcherGame {
+  gamePk: number;
+  startTime: string; // ISO UTC from MLB schedule
+  awayAbbrev: string;
+  homeAbbrev: string;
+  away: PitcherInfo | null;
+  home: PitcherInfo | null;
+}
+
+export async function fetchTodaysPitchers(date: string): Promise<PitcherGame[]> {
   const url = `${MLB_API}/schedule?sportId=1&date=${date}&hydrate=probablePitcher`;
   const data = await fetchJson(url);
-  const pitchers: Record<string, PitcherInfo> = {};
+  const games: PitcherGame[] = [];
 
-  if (!data) return pitchers;
+  if (!data) return games;
 
   for (const dateGroup of data.dates || []) {
     for (const game of dateGroup.games || []) {
-      for (const side of ["away", "home"] as const) {
-        const teamData = game.teams?.[side];
-        const pitcher = teamData?.probablePitcher;
-        // The MLB schedule API doesn't include team abbreviations — it only
-        // returns id/name/link. Derive the abbreviation from the full name.
-        const teamAbbrev = mlbTeamToAbbr(teamData?.team?.name);
+      const awayTeamData = game.teams?.away;
+      const homeTeamData = game.teams?.home;
+      const awayAbbrev = mlbTeamToAbbr(awayTeamData?.team?.name);
+      const homeAbbrev = mlbTeamToAbbr(homeTeamData?.team?.name);
 
-        if (pitcher?.id && pitcher?.fullName && teamAbbrev) {
-          pitchers[teamAbbrev] = {
-            name: pitcher.fullName,
-            id: pitcher.id,
-            team: teamAbbrev,
-          };
+      const extractPitcher = (teamData: any): PitcherInfo | null => {
+        const pitcher = teamData?.probablePitcher;
+        const abbrev = mlbTeamToAbbr(teamData?.team?.name);
+        if (pitcher?.id && pitcher?.fullName && abbrev) {
+          return { name: pitcher.fullName, id: pitcher.id, team: abbrev };
         }
-      }
+        return null;
+      };
+
+      games.push({
+        gamePk: game.gamePk,
+        startTime: game.gameDate || "",
+        awayAbbrev,
+        homeAbbrev,
+        away: extractPitcher(awayTeamData),
+        home: extractPitcher(homeTeamData),
+      });
     }
   }
 
-  return pitchers;
+  return games;
+}
+
+/**
+ * Match an ESPN game to an MLB schedule game by teams + closest start time.
+ * Returns the matching PitcherGame or null if no match found.
+ */
+export function matchGameToMlbSchedule(
+  espnAway: string,
+  espnHome: string,
+  espnStart: string,
+  mlbGames: PitcherGame[],
+  usedPks: Set<number>,
+): PitcherGame | null {
+  const espnTime = new Date(espnStart).getTime();
+  let best: PitcherGame | null = null;
+  let bestDiff = Infinity;
+
+  for (const mg of mlbGames) {
+    if (usedPks.has(mg.gamePk)) continue;
+    // Match by team abbreviations (order matters: away vs home)
+    if (mg.awayAbbrev !== espnAway || mg.homeAbbrev !== espnHome) continue;
+    const diff = Math.abs(new Date(mg.startTime).getTime() - espnTime);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = mg;
+    }
+  }
+
+  // Only accept matches within 3 hours (doubleheaders are ~3h apart)
+  if (best && bestDiff <= 3 * 60 * 60 * 1000) {
+    usedPks.add(best.gamePk);
+    return best;
+  }
+  return null;
 }
 
 export async function fetchPitcherStats(playerId: number): Promise<{
