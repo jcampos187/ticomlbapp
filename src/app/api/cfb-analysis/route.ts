@@ -14,9 +14,10 @@ export async function GET() {
     const ctx = await fetchCfbContext();
 
     // 2. Fetch the full week's slate (odds are inline on the scoreboard).
-    const rawGames = await fetchCfbScoreboard(ctx.week, ctx.seasonYear);
+    //    ESPN's `week` param caps at 25 games, so we query by date range.
+    const rawGames = await fetchCfbScoreboard(ctx.week, ctx.seasonYear, ctx.weekStart, ctx.weekEnd);
 
-    // 3. Only keep games that have a spread (i.e. odds are posted).
+    // 3. Analysis needs odds; the schedule below shows every game.
     const gamesWithOdds = rawGames.filter(g => g.overUnder > 0 || g.awaySpread != null);
 
     // 4. Fetch team stats for scoring context (points per game).
@@ -30,7 +31,7 @@ export async function GET() {
     const teamStatsMap = new Map(teamStatsResults.map(r => [r.id, r.stats]));
 
     // 5. Assemble CfbGame objects.
-    const games: CfbGame[] = gamesWithOdds.map(raw => {
+    const buildGame = (raw: (typeof rawGames)[number]): CfbGame => {
       const awayStats = teamStatsMap.get(raw.awayTeamId);
       const homeStats = teamStatsMap.get(raw.homeTeamId);
 
@@ -60,10 +61,12 @@ export async function GET() {
         awayConference: raw.awayConference,
         homeConference: raw.homeConference,
       };
-    });
+    };
 
-    // 6. Run analysis (exclude final games).
-    const analyzable = games.filter(g => g.status !== "final");
+    // 6. Show every game in the schedule (incl. games ESPN has no odds for);
+    //    picks are computed only from games with odds, excluding finals.
+    const games: CfbGame[] = rawGames.map(buildGame);
+    const analyzable = gamesWithOdds.map(buildGame).filter(g => g.status !== "final");
     const topPicks = analyzeCfbFavorites(analyzable);
     const topAts = analyzeCfbAts(analyzable);
     const topTotals = analyzeCfbTotals(analyzable);

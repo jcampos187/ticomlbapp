@@ -68,6 +68,10 @@ export interface CfbWeekInfo {
   weekLabel: string;
   seasonType: number; // 2 regular, 3 postseason
   seasonYear: number;
+  /** Inclusive date range (YYYY-MM-DD) for the week — used to fetch the
+   *  full slate via ESPN's `dates` param (the `week` param caps at 25 games). */
+  weekStart?: string;
+  weekEnd?: string;
 }
 
 export interface CfbAnalysisResult {

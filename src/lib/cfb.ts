@@ -41,7 +41,14 @@ function resolveCurrentWeek(data: any): CfbWeekInfo {
           const label = seasonType === 3
             ? entry.label  // "Bowls" / "CFP"
             : `Week ${weekNum}`;
-          return { week: weekNum, weekLabel: label, seasonType, seasonYear };
+          // The week's date range for the scoreboard `dates` query. The entry
+          // endDate is the instant before the next week starts, so the last
+          // inclusive day is endDate minus one day.
+          const weekStart = entry.startDate.slice(0, 10); // YYYY-MM-DD
+          const endExclusive = new Date(entry.endDate);
+          endExclusive.setUTCDate(endExclusive.getUTCDate() - 1);
+          const weekEnd = endExclusive.toISOString().slice(0, 10);
+          return { week: weekNum, weekLabel: label, seasonType, seasonYear, weekStart, weekEnd };
         }
       }
       // Inside the season but between weeks — use the closest week.
@@ -108,11 +115,20 @@ export async function fetchCfbContext(): Promise<CfbWeekInfo> {
 }
 
 /**
- * Fetch the scoreboard for a specific week. ESPN defaults to the current
- * week when no params are given; we pass ?week=N explicitly.
+ * Fetch the scoreboard for a specific week. ESPN's `?week=N` param silently
+ * caps the response at 25 games, so when we have the week's date range we
+ * query by `dates=start-end` instead, which returns the full slate.
  */
-export async function fetchCfbScoreboard(week: number, seasonYear: number): Promise<RawCfbGame[]> {
-  const data = await fetchJson(`${SCOREBOARD_URL}?week=${week}&seasontype=2&season=${seasonYear}`);
+export async function fetchCfbScoreboard(
+  week: number,
+  seasonYear: number,
+  weekStart?: string,
+  weekEnd?: string,
+): Promise<RawCfbGame[]> {
+  const dateRange = weekStart && weekEnd
+    ? `dates=${weekStart.replace(/-/g, "")}-${weekEnd.replace(/-/g, "")}`
+    : `week=${week}`;
+  const data = await fetchJson(`${SCOREBOARD_URL}?${dateRange}&seasontype=2&season=${seasonYear}`);
   const games: RawCfbGame[] = [];
 
   for (const event of data.events || []) {
