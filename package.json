@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "capture": "node scripts/capture-picks.mjs",
+    "tracker": "node scripts/serve-tracker.mjs --open"
   },
   "dependencies": {
     "next": "^14.2.0",
