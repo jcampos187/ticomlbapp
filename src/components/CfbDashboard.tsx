@@ -346,6 +346,14 @@ function ErrorState({ message }: { message: string }) {
   );
 }
 
+/** Local YYYY-MM-DD in the viewer's timezone. */
+function localDateStr(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 export function CfbDashboard() {
   const [data, setData] = useState<CfbAnalysisResult | null>(null);
   const [loading, setLoading] = useState(true);
@@ -375,7 +383,18 @@ export function CfbDashboard() {
   if (!data) return <ErrorState message="No data returned." />;
 
   const isOffseason = data.games.length === 0;
-  const dayGroups = groupByDay(data.games);
+
+  // Filter to only today's games (same behavior as MLB tab)
+  const today = localDateStr();
+  const todayGames = data.games.filter(g => {
+    const d = new Date(g.startTime);
+    if (Number.isNaN(d.getTime())) return false;
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}` === today;
+  });
+  const dayGroups = groupByDay(todayGames);
 
   return (
     <div className="space-y-8">
@@ -418,47 +437,61 @@ export function CfbDashboard() {
       ))}
 
       {/* Line Movement Alerts */}
-      <LineMovementAlerts games={data.games} />
+      <LineMovementAlerts games={todayGames} />
 
-      {/* Top Moneyline Picks */}
-      {data.topPicks.length > 0 && (
-        <section>
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {data.topPicks.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
-          </div>
-        </section>
-      )}
+      {/* Top Moneyline Picks — only today's games */}
+      {(() => {
+        const todayTeamNames = new Set(todayGames.flatMap(g => [g.awayTeam, g.homeTeam, g.awayAbbrev, g.homeAbbrev]));
+        const todayPicks = data.topPicks.filter(p => todayTeamNames.has(p.team) || todayTeamNames.has(p.opponent));
+        const todayAts = data.topAts.filter(p => todayTeamNames.has(p.team) || todayTeamNames.has(p.opponent));
+        const todayTotals = data.topTotals.filter(p => todayTeamNames.has(p.away) || todayTeamNames.has(p.home));
+        const todayParlays = data.parlays.filter(p => {
+          // Check if any leg mentions a today's team
+          return p.legs.some(leg => {
+            for (const name of todayTeamNames) {
+              if (leg.includes(name)) return true;
+            }
+            return false;
+          });
+        });
+        return (
+          <>
+            {todayPicks.length > 0 && (
+              <section>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {todayPicks.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
+                </div>
+              </section>
+            )}
+            {todayAts.length > 0 && (
+              <section>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📊 Against the Spread</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {todayAts.map((pick, i) => <AtsCard key={i} pick={pick} index={i} />)}
+                </div>
+              </section>
+            )}
+            {todayTotals.length > 0 && (
+              <section>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📈 Over/Under Picks</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {todayTotals.map((total, i) => <TotalCard key={i} total={total} index={i} />)}
+                </div>
+              </section>
+            )}
 
-      {/* Against the Spread */}
-      {data.topAts.length > 0 && (
-        <section>
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📊 Against the Spread</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {data.topAts.map((pick, i) => <AtsCard key={i} pick={pick} index={i} />)}
-          </div>
-        </section>
-      )}
-
-      {/* Over/Under */}
-      {data.topTotals.length > 0 && (
-        <section>
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📈 Over/Under Picks</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {data.topTotals.map((total, i) => <TotalCard key={i} total={total} index={i} />)}
-          </div>
-        </section>
-      )}
-
-      {/* Parlays */}
-      {data.parlays.length > 0 && (
-        <section>
-          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🎲 $10 Parlay Combinations</h2>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {data.parlays.map((parlay, i) => <ParlayCard key={i} parlay={parlay} index={i} />)}
-          </div>
-        </section>
-      )}
+            {todayParlays.length > 0 && (
+              <section>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🎲 $10 Parlay Combinations</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {todayParlays.map((parlay, i) => <ParlayCard key={i} parlay={parlay} index={i} />)}
+                </div>
+              </section>
+            )}
+          </>
+        );
+      })()}
 
       {/* Footer */}
       <div className="text-center text-xs text-muted pt-8 pb-4 border-t border-slate-800">

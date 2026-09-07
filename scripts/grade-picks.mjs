@@ -9,7 +9,7 @@
  * - Only touches rows with status "pending" — your manual grades are
  *   never overwritten, and re-running is safe.
  * - Moneyline / Spread / Total rows grade from the final score.
- * - Strikeout props grade from the game's final box (per-pitcher Ks);
+ * - Strikeout props grade via the MLB Stats API boxscore (free, no key);
  *   if the feed has no pitcher lines the row stays pending.
  * - Parlays grade the moment ANY final leg loses (parlay is dead);
  *   a parlay wins only once every leg is final and won.
@@ -29,6 +29,12 @@ const SCOREBOARD = (sport, date) =>
   `https://site.api.espn.com/apis/site/v2/sports/${sportPath(sport)}/scoreboard?dates=${date.replace(/-/g, "")}`;
 const SUMMARY = (sport, eventId) =>
   `https://site.api.espn.com/apis/site/v2/sports/${sportPath(sport)}/summary?event=${eventId}`;
+
+// MLB Stats API endpoints (free, no key required)
+const MLB_SCHEDULE = (date) =>
+  `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${date}&hydrate=linescore`;
+const MLB_BOXSCORE = (gamePk) =>
+  `https://statsapi.mlb.com/api/v1/game/${gamePk}/boxscore`;
 
 function sportPath(sport) {
   return { MLB: "baseball/mlb", NFL: "football/nfl", CFB: "football/college-football" }[sport] || "";
@@ -77,6 +83,94 @@ function gamesFromScoreboard(d, groupDate) {
   return out;
 }
 
+/* ---------------------------------------------------------------- */
+/* MLB Stats API → games + pitcher Ks                                */
+/* ---------------------------------------------------------------- */
+
+/** Fetch MLB games from the statsapi for a given date. */
+async function mlbGamesFromDate(date) {
+  try {
+    const data = await fetchJSON(MLB_SCHEDULE(date));
+    const out = [];
+    for (const g of data.dates?.[0]?.games || []) {
+      const status = g.status?.detailedState || "";
+      const state = status === "Final" ? "post" : status === "In Progress" ? "in" : "pre";
+      const mk = (t) => ({
+        name: t.team?.name || "",
+        full: t.team?.name || "",
+        abbrev: t.team?.abbreviation || "",
+        score: Number(t.score || 0),
+        winner: !!t.isWinner,
+      });
+      out.push({
+        id: String(g.gamePk),
+        date: g.gameDate?.slice(0, 10) || date,
+        group: date,
+        state,
+        status,
+        home: mk(g.teams.home),
+        away: mlbAway(g),
+        _mlbPk: g.gamePk,
+      });
+    }
+    return out;
+  } catch (err) {
+    console.error(`  MLB Stats API ${date}: fetch failed — ${err.message}`);
+    return [];
+  }
+}
+
+function mlbAway(g) {
+  const t = g.teams.away;
+  return {
+    name: t.team?.name || "",
+    full: t.team?.name || "",
+    abbrev: t.team?.abbreviation || "",
+    score: Number(t.score || 0),
+    winner: !!t.isWinner,
+  };
+}
+
+/** Get pitcher strikeout counts from MLB Stats API boxscore. Returns Map<pitcherNameLower, Ks>. */
+async function mlbPitcherKs(gamePk) {
+  try {
+    const data = await fetchJSON(MLB_BOXSCORE(gamePk));
+    const ks = new Map();
+    for (const side of ["home", "away"]) {
+      const players = data.teams?.[side]?.players || {};
+      for (const [, p] of Object.entries(players)) {
+        const pitching = p.stats?.pitching;
+        if (pitching?.strikeOuts != null) {
+          const name = p.person?.fullName || "";
+          ks.set(norm(name), Number(pitching.strikeOuts));
+          // Also index by last name for fuzzy matching
+          const parts = name.split(/\s+/);
+          if (parts.length > 1) ks.set(norm(parts[parts.length - 1]), Number(pitching.strikeOuts));
+        }
+      }
+    }
+    return ks;
+  } catch {
+    return new Map();
+  }
+}
+
+/** Match a pitcher name to a K count from the boxscore map. */
+function lookupPitcherKs(ksMap, pitcherName) {
+  const want = norm(pitcherName);
+  if (ksMap.has(want)) return ksMap.get(want);
+  // Try last name
+  const parts = pitcherName.split(/\s+/);
+  if (parts.length > 1 && ksMap.has(norm(parts[parts.length - 1])))
+    return ksMap.get(norm(parts[parts.length - 1]));
+  // Fuzzy: find any key that contains the pitcher's last name
+  const last = norm(parts[parts.length - 1] || pitcherName);
+  for (const [k, v] of ksMap) {
+    if (k.includes(last) || last.includes(k)) return v;
+  }
+  return null;
+}
+
 /** Best match of a team name to a game in a list; returns the game or null.
  *  A team can appear in several nearby games (doubleheaders, series), so pick
  *  deterministically: the analysis only picks upcoming games, so prefer the
@@ -92,14 +186,17 @@ function matchGame(games, team, opp, preferDate) {
     const out = [];
     for (const g of games) {
       for (const side of [g.home, g.away]) {
-        if (!hasTeam(side)) continue;
+        const a = [side.name, side.full, side.abbrev].map(norm).filter(Boolean);
         const other = side === g.home ? g.away : g.home;
-        if (o && !hasOpp(other)) continue;
+        const b = [other.name, other.full, other.abbrev].map(norm).filter(Boolean);
         if (lenient) {
-          const a = [side.name, side.full, side.abbrev].map(norm).filter(Boolean);
-          const b = [other.name, other.full, other.abbrev].map(norm).filter(Boolean);
+          // Lenient: substring match in either direction
           if (!a.some((n) => n.includes(t) || t.includes(n))) continue;
           if (o && !b.some((n) => n.includes(o) || o.includes(n))) continue;
+        } else {
+          // Exact: team/opp names must match exactly
+          if (!hasTeam(side)) continue;
+          if (o && !hasOpp(other)) continue;
         }
         out.push({ game: g, side });
       }
@@ -114,8 +211,6 @@ function matchGame(games, team, opp, preferDate) {
     if (arr.length === 0) return null;
     if (arr.length === 1) return arr[0];
     if (preferDate) {
-      // The analysis only picks upcoming games, so a lone non-final candidate
-      // is the row's game (doubleheaders share a UTC date across two days).
       const notFinal = arr.filter((s) => s.game.state !== "post");
       if (notFinal.length === 1) return notFinal[0];
       const sameGroup = arr.filter((s) => s.game.group === preferDate);
@@ -125,7 +220,6 @@ function matchGame(games, team, opp, preferDate) {
   };
   const exact = uniqueOf(collect(false));
   if (exact.length > 0) return pick(exact);
-  // Lenient pass: substring containment either way (e.g. "N Dakota St").
   return pick(uniqueOf(collect(true)));
 }
 
@@ -177,7 +271,6 @@ const parseLeg = (leg) => {
 /* Result computation                                                */
 /* ---------------------------------------------------------------- */
 
-/** Grade one game side vs a line/outcome. Returns "W" | "L" | "push" | null. */
 function gradeMl(g) {
   const side = g.side, other = g.side === g.game.home ? g.game.away : g.game.home;
   if (g.game.state !== "post") return null;
@@ -201,32 +294,11 @@ function gradeTotal(g, dir, line) {
   return "push";
 }
 
-/** Count a named pitcher's strikeouts from a final game summary (null if unavailable). */
-async function pitcherKs(sport, eventId, pitcherName, teamName) {
-  try {
-    const d = await fetchJSON(SUMMARY(sport, eventId));
-    const want = norm(pitcherName);
-    let found = null;
-    for (const team of d.rosters || []) {
-      if (teamName && norm(team.team?.displayName || team.team?.abbreviation) !== norm(teamName) &&
-          norm(team.team?.abbreviation) !== norm(teamName) &&
-          norm(team.team?.shortDisplayName) !== norm(teamName)) {
-        // still scan all teams — teamName may not be present; pitchers carry their own team
-      }
-      for (const r of team.roster || []) {
-        const pos = r.position?.abbreviation || "";
-        const nm = norm(r.athlete?.displayName || "");
-        if (pos !== "P" && pos !== "SP") continue;
-        if (!nm.includes(norm(pitcherName.split(" ").pop())) && want !== nm) continue;
-        const ks = (r.stats || []).find((s) => s.name === "strikeouts" || /strikeout/i.test(s.name));
-        found = ks?.value;
-        if (found != null) return Number(found);
-      }
-    }
-  } catch {
-    /* fall through */
-  }
-  return null;
+/** Get a pitcher's K count using the MLB Stats API boxscore. */
+async function pitcherKs(sport, gamePk, pitcherName) {
+  if (sport !== "MLB" || !gamePk) return null;
+  const ksMap = await mlbPitcherKs(gamePk);
+  return lookupPitcherKs(ksMap, pitcherName);
 }
 
 /* ---------------------------------------------------------------- */
@@ -259,10 +331,6 @@ async function main() {
     return;
   }
 
-  // ESPN groups games by US-Eastern date, but pick rows are stamped with the
-  // UTC date, so a late game (e.g. 10pm ET) can be off by one day. Fetch each
-  // sport's needed dates plus the day before, capped at today (ET), then match
-  // games across the whole sport list (a team plays once per slate).
   const todayET = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
   const minusOne = (d) => {
     const dt = new Date(`${d}T12:00:00Z`);
@@ -273,8 +341,10 @@ async function main() {
   for (const p of pending) {
     for (const d of [p.date, minusOne(p.date)]) if (d <= todayET) fetchDates.add(d);
   }
-  const gamesByKey = new Map(); // `${sport}|${date}` -> games
-  const allBySport = new Map(); // sport -> concat of every fetched date
+
+  // Fetch ESPN scoreboards for all sports
+  const gamesByKey = new Map(); // `${sport}|${date}` -> games (ESPN)
+  const allBySport = new Map(); // sport -> concat of every fetched date (ESPN)
   for (const sport of [...new Set(pending.map((p) => p.sport))]) {
     if (!sportPath(sport)) continue;
     allBySport.set(sport, []);
@@ -285,10 +355,29 @@ async function main() {
         gamesByKey.set(`${sport}|${date}`, gs);
         allBySport.get(sport).push(...gs);
       } catch (err) {
-        console.error(`  ${sport} ${date}: scoreboard fetch failed — ${err.message}`);
+        console.error(`  ${sport} ${date}: ESPN scoreboard fetch failed — ${err.message}`);
       }
     }
   }
+
+  // Fetch MLB Stats API games for K prop grading
+  const mlbGamesAll = []; // all MLB games from statsapi
+  const mlbGamesByDate = new Map(); // date -> games
+  const hasKProps = pending.some((p) => p.category === "Strikeout Prop" && p.sport === "MLB");
+  if (hasKProps) {
+    for (const date of fetchDates) {
+      try {
+        const gs = await mlbGamesFromDate(date);
+        mlbGamesByDate.set(date, gs);
+        mlbGamesAll.push(...gs);
+      } catch (err) {
+        console.error(`  MLB Stats API ${date}: fetch failed — ${err.message}`);
+      }
+    }
+  }
+
+  // Cache: gamePk -> pitcher Ks map (avoid re-fetching for parlays)
+  const kCache = new Map();
 
   let changed = 0;
   for (const row of pending) {
@@ -296,16 +385,21 @@ async function main() {
       console.log(`  — ${row.date} ${row.sport} ${row.category} [${row.pick.slice(0, 60)}…] · future slate — not played yet`);
       continue;
     }
-    // A team plays on consecutive days (MLB), so only search the dates that
-    // could hold THIS row's game: its own date plus the day before (ESPN uses
-    // ET while rows are stamped in UTC). Parlays search the whole sport.
-    const games =
-      row.category === "Parlay"
+
+    // For K props, prefer MLB Stats API matching; for everything else, use ESPN
+    const isKProp = row.category === "Strikeout Prop" && row.sport === "MLB";
+    const games = isKProp
+      ? [
+          ...(mlbGamesByDate.get(row.date) || []),
+          ...(mlbGamesByDate.get(minusOne(row.date)) || []),
+        ]
+      : row.category === "Parlay"
         ? allBySport.get(row.sport) || []
         : [
             ...(gamesByKey.get(`${row.sport}|${row.date}`) || []),
             ...(gamesByKey.get(`${row.sport}|${minusOne(row.date)}`) || []),
           ];
+
     const parsed = parsePick(row.category, row.pick);
     if (!parsed) continue;
 
@@ -328,17 +422,53 @@ async function main() {
       else if (m.game.state !== "post") { why = m.game.status; }
       else { const r = gradeTotal(m, parsed.dir, parsed.line); if (r === "push") { why = "push — no W/L recorded"; } else status = r; }
     } else if (parsed.type === "k") {
-      const m = matchGame(games, parsed.team, parsed.opp, row.date);
-      if (!m) { why = "game not found on slate"; }
-      else if (m.game.state !== "post") { why = m.game.status; }
-      else {
-        const ks = await pitcherKs(row.sport, m.game.id, parsed.pitcher, parsed.team);
-        if (ks == null) { why = "final box has no pitcher lines — grade manually"; }
-        else { const over = ks > parsed.line; status = parsed.dir === "Over" ? (over ? "W" : "L") : (over ? "L" : "W"); }
+      // For MLB K props, use MLB Stats API game matching + boxscore
+      if (row.sport === "MLB") {
+        // Match game from MLB Stats API list
+        const mlbMatch = matchGame(games, parsed.team, parsed.opp, row.date);
+        if (!mlbMatch) {
+          why = "game not found on MLB schedule";
+        } else if (mlbMatch.game.state !== "post") {
+          why = mlbMatch.game.status || "game not finished";
+        } else {
+          const gamePk = mlbMatch.game._mlbPk || mlbMatch.game.id;
+          if (!kCache.has(gamePk)) {
+            kCache.set(gamePk, await mlbPitcherKs(gamePk));
+          }
+          const ksMap = kCache.get(gamePk);
+          const ks = lookupPitcherKs(ksMap, parsed.pitcher);
+          if (ks == null) {
+            why = "pitcher not found in boxscore — grade manually";
+          } else {
+            const over = ks > parsed.line;
+            status = parsed.dir === "Over" ? (over ? "W" : "L") : (over ? "L" : "W");
+            console.log(`  ✓ ${parsed.pitcher}: ${ks} Ks (line: ${parsed.line}) → ${status}`);
+          }
+        }
+      } else {
+        // Non-MLB sports: use ESPN (unlikely to have K props, but fallback)
+        const m = matchGame(games, parsed.team, parsed.opp, row.date);
+        if (!m) { why = "game not found on slate"; }
+        else if (m.game.state !== "post") { why = m.game.status; }
+        else {
+          const ks = await pitcherKs(row.sport, m.game.id, parsed.pitcher);
+          if (ks == null) { why = "final box has no pitcher lines — grade manually"; }
+          else { const over = ks > parsed.line; status = parsed.dir === "Over" ? (over ? "W" : "L") : (over ? "L" : "W"); }
+        }
       }
     } else if (parsed.type === "parlay") {
-      // Parlays may reference games on later dates — search the whole sport.
-      const sportGames = games;
+      // Parlays should only search games from the pick's date (+day before),
+      // NOT all games across all dates — otherwise a leg can match a previous
+      // day's final game and incorrectly grade the parlay.
+      const parlayGames = [
+        ...(gamesByKey.get(`${row.sport}|${row.date}`) || []),
+        ...(gamesByKey.get(`${row.sport}|${minusOne(row.date)}`) || []),
+      ];
+      const mlbParlayGames = [
+        ...(mlbGamesByDate.get(row.date) || []),
+        ...(mlbGamesByDate.get(minusOne(row.date)) || []),
+      ];
+      const sportGames = parlayGames;
       const legResults = [];
       for (const leg of parsed.legs) {
         const lp = parseLeg(leg);
@@ -356,9 +486,23 @@ async function main() {
           if (!m || m.game.state !== "post") { legResults.push("pending"); continue; }
           legResults.push(gradeTotal(m, lp.dir, lp.line));
         } else if (lp.type === "k") {
-          // A leg only names the pitcher (no team), so we can't find its game
-          // from the scoreboard alone — treat as pending until resolved.
-          legResults.push("pending");
+          // K prop in a parlay: use MLB Stats API if MLB
+          if (row.sport === "MLB") {
+            let found = false;
+            for (const g of mlbParlayGames) {
+              const kMap = kCache.get(g._mlbPk || g.id);
+              if (kMap && lookupPitcherKs(kMap, lp.pitcher) != null) {
+                const ks = lookupPitcherKs(kMap, lp.pitcher);
+                const over = ks > lp.line;
+                legResults.push(over ? "W" : "L");
+                found = true;
+                break;
+              }
+            }
+            if (!found) legResults.push("pending");
+          } else {
+            legResults.push("pending");
+          }
         }
       }
       if (legResults.includes("L")) { status = "L"; }

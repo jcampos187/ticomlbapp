@@ -3,80 +3,64 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Pick Tracker — W/L</title>
+<title>Pick Tracker</title>
 <style>
-  :root { --bg:#0f1115; --card:#171a21; --line:#262b36; --text:#e6e9ef; --muted:#8b93a3;
-          --w:#22c55e; --l:#ef4444; --pending:#f59e0b; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--text);
-         font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width:860px; margin:0 auto; padding:20px 16px 60px; }
-  h1 { font-size:20px; margin:6px 0 2px; }
-  .sub { color:var(--muted); font-size:13px; margin-bottom:14px; }
-  .stats { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0; }
-  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px;
-          padding:8px 16px; text-align:center; min-width:86px; }
-  .stat .num { font-size:20px; font-weight:700; }
-  .stat .lbl { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
-  .stat.w .num { color:var(--w); } .stat.l .num { color:var(--l); }
-  .stat.p .num { color:var(--pending); }
-  .filters { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 4px; }
-  .filters button { background:var(--card); color:var(--text); border:1px solid var(--line);
-          border-radius:999px; padding:5px 13px; cursor:pointer; font-size:13px; }
-  .filters button.active { background:#2c3a52; border-color:#4a6fa5; }
-  .filters button .cnt { color:var(--muted); }
-  .day { margin:18px 0 6px; font-size:13px; font-weight:600; color:var(--muted);
-         text-transform:uppercase; letter-spacing:.5px; display:flex; align-items:center; gap:8px; }
-  .day .dot { width:6px; height:6px; border-radius:50%; background:var(--muted); }
-  .row { display:flex; align-items:center; gap:10px; background:var(--card);
-         border:1px solid var(--line); border-radius:10px; padding:9px 12px; margin-bottom:7px; }
-  .sport { font-size:11px; font-weight:700; padding:2px 7px; border-radius:5px; flex:0 0 auto; }
-  .sport.MLB { background:#1d3a5f; color:#7cc0ff; }
-  .sport.NFL { background:#3a2e1d; color:#ffc46b; }
-  .sport.CFB { background:#332a1d; color:#ffd27c; }
-  .cat { font-size:11px; color:var(--muted); flex:0 0 auto; min-width:74px; }
-  .pick { flex:1 1 auto; font-size:14px; word-break:break-word; }
-  .status { font-size:12px; font-weight:700; border-radius:6px; padding:2px 8px; flex:0 0 auto; }
-  .status.W { color:var(--w); } .status.L { color:var(--l); } .status.pending { color:var(--pending); }
-  .btns { display:flex; gap:5px; flex:0 0 auto; }
-  .btns button { border:0; border-radius:7px; padding:6px 13px; font-size:13px; font-weight:700;
-                 cursor:pointer; color:#fff; }
-  .btns .w { background:#15803d; } .btns .w:hover { background:#16a34a; }
-  .btns .l { background:#b91c1c; } .btns .l:hover { background:#dc2626; }
-  .btns .undo { background:#374151; color:var(--muted); padding:6px 10px; }
-  .btns .undo:hover { color:#fff; }
-  .empty { color:var(--muted); text-align:center; padding:40px 0; }
-  .hint { color:var(--muted); font-size:13px; }
-  .hint code { background:var(--card); border:1px solid var(--line); border-radius:5px; padding:1px 6px; }
+  :root { --bg:#111; --card:#1a1a1a; --line:#2a2a2a; --text:#ddd; --muted:#777; --green:#2ecc71; --red:#e74c3c; --amber:#f39c12; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, sans-serif; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 4px; }
+  .meta { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 16px; font-size: 13px; }
+  .summary span { color: var(--muted); }
+  .summary b { color: var(--text); }
+  .w b { color: var(--green); }
+  .l b { color: var(--red); }
+  .p b { color: var(--amber); }
+  .pct b { color: var(--text); }
+
+  /* Filters */
+  .filters { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .filters button { background: var(--card); border: 1px solid var(--line); color: var(--muted);
+    padding: 4px 12px; border-radius: 14px; cursor: pointer; font-size: 12px; }
+  .filters button.on { background: #2a2a2a; color: var(--text); border-color: #555; }
+
+  /* Day group */
+  .date-header { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+    padding: 12px 0 4px; border-bottom: 1px solid var(--line); margin-bottom: 6px; }
+
+  /* Pick row */
+  .row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid #1e1e1e; }
+  .sport-tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 3px; text-transform: uppercase; }
+  .sport-tag.MLB { background: #1a3050; color: #6fb4e8; }
+  .sport-tag.NFL { background: #3a2e1d; color: #ffc46b; }
+  .sport-tag.CFB { background: #332a1d; color: #ffd27c; }
+  .cat { font-size: 11px; color: var(--muted); min-width: 80px; }
+  .pick-text { flex: 1; font-size: 13px; }
+  .status { font-size: 11px; font-weight: 700; min-width: 28px; text-align: center; }
+  .status.W { color: var(--green); }
+  .status.L { color: var(--red); }
+  .status.pending { color: var(--amber); }
+  .btns { display: flex; gap: 4px; }
+  .btns button { border: none; border-radius: 4px; padding: 3px 10px; font-size: 11px; font-weight: 700; cursor: pointer; color: #fff; }
+  .btns .w { background: #27ae60; }
+  .btns .l { background: #c0392b; }
+  .btns .undo { background: #333; color: var(--muted); padding: 3px 8px; }
+  .btns .undo:hover { color: #fff; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>🎯 Pick Tracker</h1>
-  <div class="sub">Run <code>node scripts/capture-picks.mjs</code> to pull in each day's picks.</div>
 
-  <div class="stats">
-    <div class="stat w"><div class="num" id="nW">0</div><div class="lbl">Wins</div></div>
-    <div class="stat l"><div class="num" id="nL">0</div><div class="lbl">Losses</div></div>
-    <div class="stat p"><div class="num" id="nP">0</div><div class="lbl">Pending</div></div>
-    <div class="stat"><div class="num" id="nPct">—</div><div class="lbl">Win %</div></div>
-  </div>
+<h1>Pick Tracker</h1>
+<p class="meta">Grade your picks. Changes save instantly.</p>
 
-  <div class="filters" id="sportFilters"></div>
-  <div class="filters" id="statusFilters"></div>
-  <div id="list"></div>
-</div>
+<div class="summary" id="summary"></div>
+<div class="filters" id="filters"></div>
+<div id="list"></div>
 
 <script>
 let all = [];
-let sport = "ALL";
-let status = "ALL";
-
-function esc(s) {
-  return String(s).replace(/[&<>"]/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
-  });
-}
+let filterSport = "ALL";
+let filterStatus = "ALL";
 
 async function load() {
   const r = await fetch("/api/picks");
@@ -84,106 +68,76 @@ async function load() {
   render();
 }
 
-function filtered() {
-  return all.filter(function (p) {
-    return (sport === "ALL" || p.sport === sport) &&
-           (status === "ALL" || p.status === status);
-  });
-}
-
-function renderFilters() {
-  const sports = ["ALL"].concat(Array.from(new Set(all.map(function (p) { return p.sport; }))));
-  document.getElementById("sportFilters").innerHTML = sports.map(function (s) {
-    const cnt = s === "ALL" ? all.length : all.filter(function (p) { return p.sport === s; }).length;
-    return '<button class="' + (sport === s ? "active" : "") + '" data-sport="' + esc(s) + '">' +
-      esc(s) + ' <span class="cnt">' + cnt + "</span></button>";
-  }).join("");
-
-  const statuses = ["ALL", "pending", "W", "L"];
-  const labels = { ALL: "All", pending: "Pending", W: "✅ Won", L: "❌ Lost" };
-  document.getElementById("statusFilters").innerHTML = statuses.map(function (s) {
-    const cnt = s === "ALL" ? all.length : all.filter(function (p) { return p.status === s; }).length;
-    return '<button class="' + (status === s ? "active" : "") + '" data-status="' + s + '">' +
-      labels[s] + ' <span class="cnt">' + cnt + "</span></button>";
-  }).join("");
-
-  document.querySelectorAll("[data-sport]").forEach(function (b) {
-    b.onclick = function () { sport = b.dataset.sport; render(); };
-  });
-  document.querySelectorAll("[data-status]").forEach(function (b) {
-    b.onclick = function () { status = b.dataset.status; render(); };
-  });
-}
-
-function dayLabel(date) {
-  if (!date) return "No date";
-  const parts = date.split("-").map(Number);
-  const dt = new Date(parts[0], parts[1] - 1, parts[2]);
-  return dt.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
-}
-
 function render() {
-  const picks = filtered();
-  const nW = all.filter(function (p) { return p.status === "W"; }).length;
-  const nL = all.filter(function (p) { return p.status === "L"; }).length;
-  const nP = all.filter(function (p) { return p.status === "pending"; }).length;
-  document.getElementById("nW").textContent = nW;
-  document.getElementById("nL").textContent = nL;
-  document.getElementById("nP").textContent = nP;
-  document.getElementById("nPct").textContent = nW + nL > 0 ? Math.round((100 * nW) / (nW + nL)) + "%" : "—";
-  renderFilters();
+  // Summary
+  const w = all.filter(p => p.status === "W").length;
+  const l = all.filter(p => p.status === "L").length;
+  const p = all.filter(p => p.status === "pending").length;
+  const pct = w + l > 0 ? Math.round(w / (w + l) * 100) : null;
+  document.getElementById("summary").innerHTML =
+    '<span class="w">W: <b>' + w + '</b></span>' +
+    '<span class="l">L: <b>' + l + '</b></span>' +
+    '<span class="p">Pending: <b>' + p + '</b></span>' +
+    (pct !== null ? '<span class="pct">Win: <b>' + pct + '%</b></span>' : '');
 
-  const list = document.getElementById("list");
-  if (!picks.length) {
-    list.innerHTML = '<div class="empty">No picks here yet.' +
-      (all.length === 0 ? ' Run <b>node scripts/capture-picks.mjs</b> to pull in today\'s picks.' : "") +
-      "</div>";
+  // Filters
+  var sports = ["ALL"].concat([...new Set(all.map(p => p.sport))]);
+  var statuses = ["ALL", "pending", "W", "L"];
+  var statusLabels = { ALL: "All", pending: "Pending", W: "Won", L: "Lost" };
+  document.getElementById("filters").innerHTML =
+    sports.map(s => '<button class="' + (filterSport === s ? "on" : "") + '" onclick="setSport(\'' + s + '\')">' + s + '</button>').join("") +
+    statuses.map(s => '<button class="' + (filterStatus === s ? "on" : "") + '" onclick="setStatus(\'' + s + '\')">' + statusLabels[s] + '</button>').join("");
+
+  // Filtered picks
+  var picks = all.filter(p =>
+    (filterSport === "ALL" || p.sport === filterSport) &&
+    (filterStatus === "ALL" || p.status === filterStatus)
+  );
+
+  // Group by date
+  var grouped = {};
+  picks.forEach(p => { (grouped[p.date] = grouped[p.date] || []).push(p); });
+  var dates = Object.keys(grouped).sort().reverse();
+
+  if (!dates.length) {
+    document.getElementById("list").innerHTML = '<div style="color:var(--muted);padding:30px 0;text-align:center">No picks to show.</div>';
     return;
   }
 
-  const byDate = new Map();
-  for (const p of picks) {
-    const d = p.date || "none";
-    if (!byDate.has(d)) byDate.set(d, []);
-    byDate.get(d).push(p);
-  }
-  const dates = Array.from(byDate.keys()).sort(function (a, b) { return a < b ? 1 : a > b ? -1 : 0; });
-
-  list.innerHTML = dates.map(function (d) {
-    const rows = byDate.get(d).map(function (p) {
-      const badge = p.status === "W" ? '<span class="status W">W</span>'
+  document.getElementById("list").innerHTML = dates.map(d => {
+    var rows = grouped[d].map(p => {
+      var badge = p.status === "W" ? '<span class="status W">W</span>'
         : p.status === "L" ? '<span class="status L">L</span>'
-        : '<span class="status pending">PENDING</span>';
-      const buttons = p.status === "pending"
-        ? '<button class="w" data-id="' + p.id + '" data-result="W">W</button>' +
-          '<button class="l" data-id="' + p.id + '" data-result="L">L</button>'
-        : '<button class="undo" data-id="' + p.id + '" data-result="pending" title="Mark back as pending">↩</button>';
+        : '<span class="status pending">—</span>';
+      var btns = p.status === "pending"
+        ? '<button class="w" onclick="grade(\'' + p.id + '\',\'W\')">W</button>' +
+          '<button class="l" onclick="grade(\'' + p.id + '\',\'L\')">L</button>'
+        : '<button class="undo" onclick="grade(\'' + p.id + '\',\'pending\')">↩</button>';
       return '<div class="row">' +
-        '<span class="sport ' + esc(p.sport) + '">' + esc(p.sport) + "</span>" +
-        '<span class="cat">' + esc(p.category) + "</span>" +
-        '<span class="pick">' + esc(p.pick) + "</span>" +
+        '<span class="sport-tag ' + p.sport + '">' + p.sport + '</span>' +
+        '<span class="cat">' + p.category + '</span>' +
+        '<span class="pick-text">' + esc(p.pick) + '</span>' +
         badge +
-        '<span class="btns">' + buttons + "</span>" +
-        "</div>";
+        '<span class="btns">' + btns + '</span></div>';
     }).join("");
-    return '<div class="day"><span class="dot"></span>' + dayLabel(d) + "</div>" + rows;
+    var dt = new Date(d + "T12:00:00Z");
+    var label = dt.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    return '<div class="date-header">' + label + '</div>' + rows;
   }).join("");
-
-  list.querySelectorAll("[data-result]").forEach(function (b) {
-    b.onclick = async function () {
-      await grade(b.dataset.id, b.dataset.result);
-      await load();
-    };
-  });
 }
 
+function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function setSport(s) { filterSport = s; render(); }
+function setStatus(s) { filterStatus = s; render(); }
+
 async function grade(id, result) {
-  const r = await fetch("/api/grade", {
+  var r = await fetch("/api/grade", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: id, result: result }),
+    body: JSON.stringify({ id: id, result: result })
   });
-  if (!r.ok) alert(await r.text());
+  if (r.ok) { await load(); }
+  else { alert(await r.text()); }
 }
 
 load();
