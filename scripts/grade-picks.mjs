@@ -474,15 +474,15 @@ async function main() {
         const lp = parseLeg(leg);
         if (!lp) { legResults.push("unparseable"); continue; }
         if (lp.type === "ml") {
-          const m = matchGame(sportGames, lp.team);
+          const m = matchGame(sportGames, lp.team, null, row.date);
           if (!m || m.game.state !== "post") { legResults.push("pending"); continue; }
           legResults.push(gradeMl(m));
         } else if (lp.type === "ats") {
-          const m = matchGame(sportGames, lp.team);
+          const m = matchGame(sportGames, lp.team, null, row.date);
           if (!m || m.game.state !== "post") { legResults.push("pending"); continue; }
           legResults.push(gradeAts(m, lp.line));
         } else if (lp.type === "total") {
-          const m = matchGame(sportGames, lp.teamA, lp.teamB);
+          const m = matchGame(sportGames, lp.teamA, lp.teamB, row.date);
           if (!m || m.game.state !== "post") { legResults.push("pending"); continue; }
           legResults.push(gradeTotal(m, lp.dir, lp.line));
         } else if (lp.type === "k") {
@@ -490,7 +490,12 @@ async function main() {
           if (row.sport === "MLB") {
             let found = false;
             for (const g of mlbParlayGames) {
-              const kMap = kCache.get(g._mlbPk || g.id);
+              const gPk = g._mlbPk || g.id;
+              // Fetch boxscore if not already cached
+              if (!kCache.has(gPk)) {
+                kCache.set(gPk, await mlbPitcherKs(gPk));
+              }
+              const kMap = kCache.get(gPk);
               if (kMap && lookupPitcherKs(kMap, lp.pitcher) != null) {
                 const ks = lookupPitcherKs(kMap, lp.pitcher);
                 const over = ks > lp.line;
