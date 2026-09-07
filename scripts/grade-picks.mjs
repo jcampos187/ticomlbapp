@@ -424,8 +424,39 @@ async function main() {
     } else if (parsed.type === "k") {
       // For MLB K props, use MLB Stats API game matching + boxscore
       if (row.sport === "MLB") {
-        // Match game from MLB Stats API list
-        const mlbMatch = matchGame(games, parsed.team, parsed.opp, row.date);
+        // Match game from MLB Stats API list.
+        // For doubleheaders, try each game until we find one with the pitcher's Ks.
+        let mlbMatch = matchGame(games, parsed.team, parsed.opp, row.date);
+        if (!mlbMatch) {
+          // Doubleheader: matchGame returned null — find all candidate games
+          // and try each one's boxscore for the pitcher.
+          const candidates = [];
+          const t = norm(parsed.team), o = norm(parsed.opp);
+          for (const g of games) {
+            for (const side of [g.home, g.away]) {
+              const a = [side.name, side.full, side.abbrev].map(norm).filter(Boolean);
+              if (!a.some((n) => n.includes(t) || t.includes(n))) continue;
+              const other = side === g.home ? g.away : g.home;
+              const b = [other.name, other.full, other.abbrev].map(norm).filter(Boolean);
+              if (o && !b.some((n) => n.includes(o) || o.includes(n))) continue;
+              candidates.push(g);
+            }
+          }
+          const seen = new Set();
+          const uniqueCandidates = candidates.filter(g => (seen.has(g.id) ? false : (seen.add(g.id), true)));
+          for (const c of uniqueCandidates) {
+            if (c.state !== "post") continue;
+            const gPk = c._mlbPk || c.id;
+            if (!kCache.has(gPk)) kCache.set(gPk, await mlbPitcherKs(gPk));
+            const ksMap = kCache.get(gPk);
+            if (lookupPitcherKs(ksMap, parsed.pitcher) != null) {
+              mlbMatch = { game: c, side: c.home };
+              break;
+            }
+          }
+          // If still no match, fall back to the first candidate
+          if (!mlbMatch && uniqueCandidates.length > 0) mlbMatch = { game: uniqueCandidates[0], side: uniqueCandidates[0].home };
+        }
         if (!mlbMatch) {
           why = "game not found on MLB schedule";
         } else if (mlbMatch.game.state !== "post") {
