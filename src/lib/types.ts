@@ -66,9 +66,33 @@ export interface Parlay {
   profit: number;
 }
 
+export type Confidence = "A" | "B" | "C" | "D";
+
+/**
+ * Model-vs-market edge for one team in one game. The model probability
+ * comes from a logistic win-probability model (records, R/G, starter ERA /
+ * K/9, bullpen ERA, home field); the market probability is the raw implied
+ * probability of the moneyline. Edge = model - market in percentage points.
+ */
+export interface ModelEdge {
+  team: string;
+  abbrev: string;
+  opponent: string;
+  /** Game id — lets parlay builders avoid two legs from the same game. */
+  gameId: string;
+  ml: number;
+  home: boolean;
+  modelProb: number; // % (0-100)
+  marketProb: number; // % (0-100)
+  edge: number; // percentage points (model - market)
+  confidence: Confidence;
+  reasons: string[];
+}
+
 export interface AnalysisResult {
   date: string;
   games: Game[];
+  edges: ModelEdge[];
   topPicks: TopPick[];
   topKProps: KProp[];
   topTotals: TotalPick[];

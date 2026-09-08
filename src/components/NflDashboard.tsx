@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import type { NflAnalysisResult } from "@/lib/nflTypes";
-import { formatOdds } from "@/lib/analysis";
+import { formatOdds, americanToDecimal } from "@/lib/analysis";
+import { nflTeamWinProbability } from "@/lib/nflAnalysis";
 import { GameTime } from "@/components/GameTime";
 
 function localDateStr(d: Date = new Date()): string {
@@ -57,6 +58,28 @@ function LineMove({ current, open }: { current: number; open: number | null }) {
     <span className={`text-xs ${cls}`} title={`Opened at ${formatOdds(open)}`}>
       {arrow} {Math.abs(move)}
     </span>
+  );
+}
+
+/** Compact model-vs-market line under each team in a game card. */
+function EdgeRow({ game, side }: { game: NflAnalysisResult["games"][0]; side: "away" | "home" }) {
+  const modelProb = nflTeamWinProbability(game, side);
+  if (modelProb == null) return null;
+  const ml = side === "away" ? game.awayML : game.homeML;
+  const marketProb = (1 / americanToDecimal(ml)) * 100;
+  const edge = modelProb - marketProb;
+  const edgeCls = edge >= 3 ? "text-green-400" : edge <= -3 ? "text-red-400" : "text-muted";
+  return (
+    <div className="flex items-center justify-between text-xs text-muted mt-0.5">
+      <span>
+        Model <b className="text-slate-300">{modelProb.toFixed(1)}%</b>
+        <span className="mx-1">·</span>
+        Mkt <b className="text-slate-300">{marketProb.toFixed(1)}%</b>
+      </span>
+      <span className={`font-bold ${edgeCls}`}>
+        Edge {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+      </span>
+    </div>
   );
 }
 
@@ -189,6 +212,7 @@ function NflGameCard({ game, index }: { game: NflAnalysisResult["games"][0]; ind
           <OddsDisplay odds={game.awayML} />
         </div>
       </div>
+      <EdgeRow game={game} side="away" />
 
       {/* Divider */}
       <div className="flex items-center gap-2 my-1">
@@ -216,6 +240,7 @@ function NflGameCard({ game, index }: { game: NflAnalysisResult["games"][0]; ind
           <OddsDisplay odds={game.homeML} />
         </div>
       </div>
+      <EdgeRow game={game} side="home" />
 
       {/* Expandable details: spread line + projected prop candidates */}
       {showDetails && (
@@ -245,6 +270,58 @@ function NflGameCard({ game, index }: { game: NflAnalysisResult["games"][0]; ind
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+const CONFIDENCE_CLS: Record<string, string> = {
+  A: "bg-green-500/20 text-green-400",
+  B: "bg-blue-500/20 text-blue-400",
+  C: "bg-amber-500/20 text-amber-400",
+  D: "bg-slate-700 text-muted",
+};
+
+function ModelEdgeCard({ edge, index }: { edge: NflAnalysisResult["edges"][0]; index: number }) {
+  return (
+    <div
+      className="glass rounded-xl p-4 card-hover animate-in border-l-4 border-l-green-500"
+      style={{ animationDelay: `${index * 80}ms` }}
+    >
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-medium">
+          #{index + 1} Edge
+        </span>
+        <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${CONFIDENCE_CLS[edge.confidence]}`}>
+          Confidence: {edge.confidence}
+        </span>
+      </div>
+      <div className="text-lg font-bold mb-1">
+        {edge.team} ML <span className="text-sm font-normal text-muted">{formatOdds(edge.ml)}</span>
+      </div>
+      <div className="text-sm text-muted mb-3">vs {edge.opponent}</div>
+      <div className="space-y-1.5 text-sm mb-3">
+        <div className="flex justify-between text-sm py-1">
+          <span className="text-muted">Model probability</span>
+          <span className="font-medium">{edge.modelProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between text-sm py-1">
+          <span className="text-muted">Market probability</span>
+          <span className="font-medium">{edge.marketProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between text-sm py-1 border-t border-slate-700">
+          <span className="text-muted">Edge</span>
+          <span className="font-bold text-green-400">
+            {edge.edge >= 0 ? "+" : ""}{edge.edge.toFixed(1)}%
+          </span>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1">
+        {edge.reasons.map((r, i) => (
+          <span key={i} className="text-xs bg-slate-700/50 px-2 py-0.5 rounded-full text-slate-300">
+            {r}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -482,6 +559,21 @@ export function NflDashboard() {
 
       {/* Line Movement Alerts */}
       <LineMovementAlerts games={data.games} />
+
+      {/* Model Edge Picks */}
+      {data.edges && data.edges.length > 0 && (
+        <section>
+          <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
+            🎯 Model Edge Picks
+            <span className="text-xs text-muted font-normal">(model prob − market implied)</span>
+          </h2>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            {data.edges.map((edge, i) => (
+              <ModelEdgeCard key={`${edge.team}-${edge.opponent}`} edge={edge} index={i} />
+            ))}
+          </div>
+        </section>
+      )}
 
       {/* Top Moneyline Picks */}
       {data.topPicks.length > 0 && (

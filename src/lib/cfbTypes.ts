@@ -63,6 +63,28 @@ export interface CfbParlay {
   profit: number;
 }
 
+/**
+ * Model-vs-market edge for one team in one game (CFB flavor). The model
+ * probability comes from a logistic win-probability model (win rate, PPG,
+ * home field); the market probability is the raw implied probability of the
+ * moneyline. Edge = model - market in percentage points. CFB moneylines are
+ * often OFF, so edges only appear for games with a posted ML.
+ */
+export interface CfbModelEdge {
+  team: string;
+  abbrev: string;
+  opponent: string;
+  /** Game id — lets parlay builders avoid two legs from the same game. */
+  gameId: string;
+  ml: number;
+  home: boolean;
+  modelProb: number; // % (0-100)
+  marketProb: number; // % (0-100)
+  edge: number; // percentage points (model - market)
+  confidence: "A" | "B" | "C" | "D";
+  reasons: string[];
+}
+
 export interface CfbWeekInfo {
   week: number;
   weekLabel: string;
@@ -81,6 +103,7 @@ export interface CfbAnalysisResult {
   seasonType: number;
   seasonYear: number;
   games: CfbGame[];
+  edges: CfbModelEdge[];
   topPicks: CfbTopPick[];
   topAts: CfbAtsPick[];
   topTotals: CfbTotalPick[];

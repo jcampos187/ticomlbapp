@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { fetchCfbContext, fetchCfbScoreboard, fetchCfbTeamStats } from "@/lib/cfb";
-import { analyzeCfbFavorites, analyzeCfbAts, analyzeCfbTotals, buildCfbParlays } from "@/lib/cfbAnalysis";
+import { analyzeCfbFavorites, analyzeCfbAts, analyzeCfbTotals, buildCfbParlays, computeCfbModelEdges } from "@/lib/cfbAnalysis";
 import type { CfbGame, CfbAnalysisResult } from "@/lib/cfbTypes";
 
 export const revalidate = 300;
@@ -67,10 +67,11 @@ export async function GET() {
     //    picks are computed only from games with odds, excluding finals.
     const games: CfbGame[] = rawGames.map(buildGame);
     const analyzable = gamesWithOdds.map(buildGame).filter(g => g.status !== "final");
+    const edges = computeCfbModelEdges(analyzable);
     const topPicks = analyzeCfbFavorites(analyzable);
     const topAts = analyzeCfbAts(analyzable);
     const topTotals = analyzeCfbTotals(analyzable);
-    const parlays = buildCfbParlays(topPicks, topAts, topTotals);
+    const parlays = buildCfbParlays(edges, topAts, topTotals);
 
     const result: CfbAnalysisResult = {
       date: new Date().toISOString().slice(0, 10),
@@ -79,6 +80,7 @@ export async function GET() {
       seasonType: ctx.seasonType,
       seasonYear: ctx.seasonYear,
       games,
+      edges,
       topPicks,
       topAts,
       topTotals,

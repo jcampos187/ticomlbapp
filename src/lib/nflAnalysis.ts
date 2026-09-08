@@ -1,5 +1,116 @@
-import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate } from "./nflTypes";
-import { americanToDecimal, formatOdds, calculateParlayPayout } from "./analysis";
+import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate, NflModelEdge } from "./nflTypes";
+import { americanToDecimal, formatOdds, calculateParlayPayout, sigmoid, marketProbability, edgeConfidence } from "./analysis";
+
+// --- Model Edge: logistic win-probability model vs market implied ---
+// Same structure as MLB but NFL games have no pitcher stats, so the model
+// leans on record + scoring output (+ home field).
+const NFL_LEAGUE_AVG = {
+  winRate: 0.5,
+  ppg: 23.0,
+};
+
+// A record must represent at least this many games before win rate counts as
+// a real signal. Before the season (0-0 records, null PPG) no team qualifies,
+// so no edges are produced — honest behavior instead of 50%-vs-market noise.
+const MIN_EDGE_GAMES = 4;
+
+// NFL home field ≈ 2.5 points, and ~1 point of expected margin ≈ 0.13
+// logits (a 7-pt favorite ≈ 72% win prob). Win-rate diff reuses the MLB
+// coefficient — a win rate is a win rate.
+const NFL_HOME_ADV = 0.33;
+const NFL_COEF_WIN_RATE = 3.2;
+const NFL_COEF_PPG = 0.13;
+
+interface NflModelInputs {
+  winRate: number;
+  ppg: number;
+  complete: boolean;
+}
+
+function nflInputs(game: NflGame, side: "away" | "home"): NflModelInputs {
+  const winRateRaw = (side === "away" ? game.awayRecord : game.homeRecord) || "";
+  const [w, l] = winRateRaw.split("-").map(Number);
+  const games = Number.isFinite(w) && Number.isFinite(l) ? w + l : 0;
+  const winRate = games >= MIN_EDGE_GAMES ? w / games : null;
+  const ppg = side === "away" ? game.awayPpg : game.homePpg;
+  return {
+    winRate: winRate ?? NFL_LEAGUE_AVG.winRate,
+    ppg: ppg ?? NFL_LEAGUE_AVG.ppg,
+    // Strong data = both sides have record (4+ games) + PPG (4 of 4 inputs).
+    complete: winRate != null && ppg != null,
+  };
+}
+
+/** Logistic win probability (%) for one side of an NFL game. */
+export function nflTeamWinProbability(game: NflGame, side: "away" | "home"): number | null {
+  const ml = side === "away" ? game.awayML : game.homeML;
+  const oppMl = side === "away" ? game.homeML : game.awayML;
+  if (!ml || !oppMl) return null;
+
+  const t = nflInputs(game, side);
+  const o = nflInputs(game, side === "away" ? "home" : "away");
+
+  let z = side === "home" ? NFL_HOME_ADV : 0;
+  z += (t.winRate - o.winRate) * NFL_COEF_WIN_RATE;
+  z += (t.ppg - o.ppg) * NFL_COEF_PPG;
+
+  return Math.min(0.97, Math.max(0.03, sigmoid(z))) * 100;
+}
+
+/**
+ * Compute the model edge for every NFL team with a moneyline and surface the
+ * positive ones (model likes the team more than the market does).
+ */
+export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
+  const edges: NflModelEdge[] = [];
+
+  for (const game of games) {
+    for (const side of ["away", "home"] as const) {
+      const team = side === "away" ? game.awayTeam : game.homeTeam;
+      const abbrev = side === "away" ? game.awayAbbrev : game.homeAbbrev;
+      const opponent = side === "away" ? game.homeTeam : game.awayTeam;
+      const ml = side === "away" ? game.awayML : game.homeML;
+      if (!ml) continue;
+
+      // No meaningful model data on either side (0-0 records, null PPG — e.g.
+      // preseason) means every "edge" would just be 50% vs the market price:
+      // noise, not signal. Skip these games entirely.
+      const t = nflInputs(game, side);
+      const o = nflInputs(game, side === "away" ? "home" : "away");
+      if (!t.complete && !o.complete) continue;
+
+      const modelProb = nflTeamWinProbability(game, side);
+      if (modelProb == null) continue;
+
+      const marketProb = marketProbability(ml);
+      const edge = modelProb - marketProb;
+
+      const reasons: string[] = [];
+      if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
+      if (t.ppg > o.ppg + 1.5) reasons.push(`${t.ppg.toFixed(1)} PPG offense`);
+      if (side === "home") reasons.push("Home field");
+
+      edges.push({
+        team,
+        abbrev,
+        opponent,
+        gameId: game.id,
+        ml,
+        home: side === "home",
+        modelProb: Math.round(modelProb * 10) / 10,
+        marketProb: Math.round(marketProb * 10) / 10,
+        edge: Math.round(edge * 10) / 10,
+        confidence: edgeConfidence(edge, t.complete && o.complete),
+        reasons,
+      });
+    }
+  }
+
+  return edges
+    .filter(e => e.edge >= 3)
+    .sort((a, b) => b.edge - a.edge)
+    .slice(0, 6);
+}
 
 // --- Line-movement thresholds (American cents / spread points) ---
 const SHARP_MOVE_CENTS = 20;
@@ -463,14 +574,24 @@ export function analyzeNflProps(games: NflGame[]): NflPropPick[] {
 
 // --- Parlays ($10, same style as MLB) ---
 export function buildNflParlays(
-  topPicks: NflTopPick[],
+  edges: NflModelEdge[],
   topAts: NflAtsPick[],
   topTotals: NflTotalPick[]
 ): NflParlay[] {
   const parlays: NflParlay[] = [];
 
-  const mlOdds = topPicks.slice(0, 3).map(p => p.ml);
-  const mlLabels = topPicks.slice(0, 3).map(p => `${p.team} ML (${formatOdds(p.ml)})`);
+  // Moneyline legs come from the model-edge layer, capped at one leg per
+  // game so a same-game pair can't create correlated legs.
+  const mlEdges: NflModelEdge[] = [];
+  const seenGames = new Set<string>();
+  for (const e of edges) {
+    if (seenGames.has(e.gameId)) continue;
+    seenGames.add(e.gameId);
+    mlEdges.push(e);
+    if (mlEdges.length >= 3) break;
+  }
+  const mlOdds = mlEdges.map(e => e.ml);
+  const mlLabels = mlEdges.map(e => `${e.team} ML (${formatOdds(e.ml)})`);
 
   const atsOdds = topAts.slice(0, 2).map(() => -110);
   const atsLabels = topAts.slice(0, 2).map(p => `${p.line} (-110)`);
@@ -478,9 +599,9 @@ export function buildNflParlays(
   // Pick a total from a game NOT involving the ML-pick teams to avoid
   // correlated legs (a team ML + that same game's total). Mirrors MLB.
   const mlTeams = new Set<string>();
-  for (const p of topPicks.slice(0, 3)) {
-    mlTeams.add(p.team);
-    mlTeams.add(p.opponent);
+  for (const e of mlEdges.slice(0, 3)) {
+    mlTeams.add(e.team);
+    mlTeams.add(e.opponent);
   }
   const totalLeg =
     topTotals.find(t => !mlTeams.has(t.away) && !mlTeams.has(t.home)) ?? topTotals[0];
@@ -488,10 +609,10 @@ export function buildNflParlays(
     ? `${totalLeg.away} @ ${totalLeg.home} ${totalLeg.pick} ${totalLeg.overUnder.toFixed(1)} (-110)`
     : null;
 
-  // Parlay 1: Top 3 Moneyline
+  // Parlay 1: Top 3 Moneyline (from model edges)
   if (mlOdds.length >= 3) {
     const p = calculateParlayPayout(mlOdds.slice(0, 3));
-    parlays.push({ name: "Top 3 Moneyline Favorites", legs: mlLabels.slice(0, 3), ...p });
+    parlays.push({ name: "Top 3 Model Edge MLs", legs: mlLabels.slice(0, 3), ...p });
   }
 
   // Parlay 2: 2 ML + 1 ATS

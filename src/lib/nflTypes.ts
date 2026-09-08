@@ -110,6 +110,27 @@ export interface NflParlay {
   profit: number;
 }
 
+/**
+ * Model-vs-market edge for one team in one game (NFL flavor). The model
+ * probability comes from a logistic win-probability model (win rate, PPG,
+ * home field); the market probability is the raw implied probability of the
+ * moneyline. Edge = model - market in percentage points.
+ */
+export interface NflModelEdge {
+  team: string;
+  abbrev: string;
+  opponent: string;
+  /** Game id — lets parlay builders avoid two legs from the same game. */
+  gameId: string;
+  ml: number;
+  home: boolean;
+  modelProb: number; // % (0-100)
+  marketProb: number; // % (0-100)
+  edge: number; // percentage points (model - market)
+  confidence: "A" | "B" | "C" | "D";
+  reasons: string[];
+}
+
 export interface NflAnalysisResult {
   date: string;
   week: number;
@@ -117,6 +138,7 @@ export interface NflAnalysisResult {
   seasonType: number; // 1 preseason, 2 regular, 3 postseason
   seasonYear: number;
   games: NflGame[];
+  edges: NflModelEdge[];
   topPicks: NflTopPick[];
   topAts: NflAtsPick[];
   topTotals: NflTotalPick[];

@@ -1,4 +1,4 @@
-import { Game, TopPick, KProp, TotalPick, Parlay } from "./types";
+import { Game, TopPick, KProp, TotalPick, Parlay, ModelEdge, Confidence } from "./types";
 
 export function americanToDecimal(odds: number): number {
   return odds > 0 ? 1 + odds / 100 : 1 + 100 / Math.abs(odds);
@@ -38,6 +38,208 @@ const LOW_K_OFFENSES = new Set([
 // interpreted as sharp money backing that team.
 const SHARP_MOVE_CENTS = 20;
 const MILD_MOVE_CENTS = 10;
+
+// ---------------------------------------------------------------------------
+// Model Edge: logistic win-probability model vs market implied probability
+// ---------------------------------------------------------------------------
+
+// League-average baselines used only to fill gaps when a team's stat is
+// missing (rookie starters, TBD pitchers, no trends fetched). Centering on
+// per-game *differences* between the two teams keeps the model relative, so
+// these baselines only matter when one side lacks a stat.
+const LEAGUE_AVG = {
+  winRate: 0.5,
+  runsPerGame: 4.5,
+  starterEra: 4.25,
+  k9: 8.6,
+  bullpenEra: 4.1,
+};
+
+// A record must represent at least this many games before win rate counts as
+// a real signal. A 2-0 start is noise; a 45-30 record is information. Teams
+// below the floor fall back to the league baseline (and are marked
+// incomplete), so early-season slates never produce confident fake edges.
+const MIN_EDGE_GAMES = 4;
+
+// Logistic coefficients. Each feature contributes to the log-odds z:
+//   z = homeAdv + b1*(winRate diff) + b2*(R/G diff) + b3*(ERA diff)
+//       + b4*(K/9 diff) + b5*(bullpen ERA diff)
+// P(win) = sigmoid(z). The magnitudes are calibrated so a strong team vs a
+// weak one (e.g. a -190 favorite) lands around a 70-75% model probability.
+//
+// Every feature is also capped (see MAX_FEATURE_LOGIT below) so a single
+// extreme mismatch — say a 3.2 vs 5.6 starter ERA — can't dominate the model
+// and print a +25% edge. Teams don't differ by 25 points of true win
+// probability on one stat alone; caps keep extreme edges rare.
+const HOME_ADV = 0.24;
+const COEF_WIN_RATE = 2.8; // +0.10 win-rate diff ~ +7pp
+const COEF_RUNS_PER_GAME = 0.22; // +1.0 R/G diff ~ +5.5pp
+const COEF_STARTER_ERA = 0.28; // +1.0 ERA edge ~ +7pp
+const COEF_K9 = 0.05; // +3.0 K/9 diff ~ +3.7pp
+const COEF_BULLPEN_ERA = 0.18; // +1.0 bullpen ERA edge ~ +4.5pp
+
+// Per-feature logit caps: the most one feature may move the win probability
+// (a 0.5 logit cap ≈ +12pp; 0.4 ≈ +10pp; 0.3 ≈ +7.5pp). Applied symmetrically.
+const MAX_FEATURE_LOGIT = {
+  winRate: 0.6,
+  runsPerGame: 0.4,
+  starterEra: 0.5,
+  k9: 0.3,
+  bullpenEra: 0.4,
+};
+
+function clampFeature(term: number, cap: number): number {
+  return Math.max(-cap, Math.min(cap, term));
+}
+
+// Edge thresholds for the A-D confidence grade. Data completeness (how many
+// of the model's inputs actually exist for both teams) can knock a grade
+// down a notch so we don't call an edge confident off a half-built model.
+const EDGE_A = 8; // A: large edge + complete data
+const EDGE_B = 5; // B: solid edge
+const EDGE_C = 3; // C: marginal edge (still shown as a pick)
+
+export function sigmoid(z: number): number {
+  return 1 / (1 + Math.exp(-z));
+}
+
+function parseWinRate(record: string): number | null {
+  if (!record) return null;
+  const [w, l] = record.split("-").map(Number);
+  if (!Number.isFinite(w) || !Number.isFinite(l)) return null;
+  const games = w + l;
+  if (games < MIN_EDGE_GAMES) return null;
+  return w / games;
+}
+
+interface TeamModelInputs {
+  winRate: number;
+  runsPerGame: number;
+  starterEra: number;
+  k9: number;
+  bullpenEra: number;
+  complete: boolean;
+}
+
+/** Gather the model inputs for one side of a game, filling gaps with league averages. */
+function teamInputs(
+  game: Game,
+  side: "away" | "home",
+): TeamModelInputs {
+  const winRate = parseWinRate(side === "away" ? game.awayRecord : game.homeRecord);
+  const runsPerGame = side === "away" ? game.awayRunsPerGame : game.homeRunsPerGame;
+  const starterEra = side === "away" ? game.awayEra : game.homeEra;
+  const k9 = side === "away" ? game.awayK9 : game.homeK9;
+  const bullpenEra = side === "away" ? game.awayBullpenEra : game.homeBullpenEra;
+
+  const present = [winRate, runsPerGame, starterEra, k9, bullpenEra]
+    .filter((v): v is number => v != null).length;
+
+  return {
+    winRate: winRate ?? LEAGUE_AVG.winRate,
+    runsPerGame: runsPerGame ?? LEAGUE_AVG.runsPerGame,
+    starterEra: starterEra ?? LEAGUE_AVG.starterEra,
+    k9: k9 ?? LEAGUE_AVG.k9,
+    bullpenEra: bullpenEra ?? LEAGUE_AVG.bullpenEra,
+    // Strong data = both teams have at least 4 of 5 core stats (counts both
+    // sides, so >= 8 of 10 present).
+    complete: present >= 4,
+  };
+}
+
+/**
+ * Logistic win probability (%) for one side of a game. Returns null when
+ * there's no moneyline to anchor the matchup (no odds = no bettable game).
+ */
+export function teamWinProbability(game: Game, side: "away" | "home"): number | null {
+  const ml = side === "away" ? game.awayML : game.homeML;
+  const oppMl = side === "away" ? game.homeML : game.awayML;
+  if (!ml || !oppMl) return null;
+
+  const t = teamInputs(game, side);
+  const o = teamInputs(game, side === "away" ? "home" : "away");
+
+  let z = side === "home" ? HOME_ADV : 0;
+  z += clampFeature((t.winRate - o.winRate) * COEF_WIN_RATE, MAX_FEATURE_LOGIT.winRate);
+  z += clampFeature((t.runsPerGame - o.runsPerGame) * COEF_RUNS_PER_GAME, MAX_FEATURE_LOGIT.runsPerGame);
+  z += clampFeature((o.starterEra - t.starterEra) * COEF_STARTER_ERA, MAX_FEATURE_LOGIT.starterEra); // lower ERA is better
+  z += clampFeature((t.k9 - o.k9) * COEF_K9, MAX_FEATURE_LOGIT.k9);
+  z += clampFeature((o.bullpenEra - t.bullpenEra) * COEF_BULLPEN_ERA, MAX_FEATURE_LOGIT.bullpenEra);
+
+  // Clamp to a sane range so a lopsided feature set can't print 99.9%.
+  return Math.min(0.97, Math.max(0.03, sigmoid(z))) * 100;
+}
+
+/** Implied market probability (%) straight from the moneyline (includes vig). */
+export function marketProbability(ml: number): number {
+  return (1 / americanToDecimal(ml)) * 100;
+}
+
+/** A-D confidence grade shared by all sports' model-edge layers. */
+export function edgeConfidence(edge: number, complete: boolean): Confidence {
+  if (edge >= EDGE_A) return complete ? "A" : "B";
+  if (edge >= EDGE_B) return complete ? "B" : "C";
+  if (edge >= EDGE_C) return "C";
+  return "D";
+}
+
+/**
+ * Compute the model edge for every team in every game with odds and surface
+ * the positive ones (model likes the team more than the market does).
+ */
+export function computeModelEdges(games: Game[]): ModelEdge[] {
+  const edges: ModelEdge[] = [];
+
+  for (const game of games) {
+    for (const side of ["away", "home"] as const) {
+      const team = side === "away" ? game.awayTeam : game.homeTeam;
+      const abbrev = side === "away" ? game.awayAbbrev : game.homeAbbrev;
+      const opponent = side === "away" ? game.homeTeam : game.awayTeam;
+      const ml = side === "away" ? game.awayML : game.homeML;
+      if (!ml) continue;
+
+      // No meaningful model data on either side (e.g. 0-0 records, no trends)
+      // means every "edge" would just be 50% vs the market price — noise, not
+      // signal. Skip these games entirely.
+      const t = teamInputs(game, side);
+      const o = teamInputs(game, side === "away" ? "home" : "away");
+      if (!t.complete && !o.complete) continue;
+
+      const modelProb = teamWinProbability(game, side);
+      if (modelProb == null) continue;
+
+      const marketProb = marketProbability(ml);
+      const edge = modelProb - marketProb;
+
+      const reasons: string[] = [];
+      if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
+      if (t.runsPerGame > o.runsPerGame + 0.3) reasons.push(`${t.runsPerGame.toFixed(2)} R/G offense`);
+      if (t.starterEra < o.starterEra - 0.3) reasons.push(`Starter ERA ${t.starterEra.toFixed(2)}`);
+      if (t.k9 > o.k9 + 1) reasons.push(`K/9 ${t.k9.toFixed(1)}`);
+      if (t.bullpenEra < o.bullpenEra - 0.3) reasons.push(`BP ERA ${t.bullpenEra.toFixed(2)}`);
+      if (side === "home") reasons.push("Home field");
+
+      edges.push({
+        team,
+        abbrev,
+        opponent,
+        gameId: game.id,
+        ml,
+        home: side === "home",
+        modelProb: Math.round(modelProb * 10) / 10,
+        marketProb: Math.round(marketProb * 10) / 10,
+        edge: Math.round(edge * 10) / 10,
+        confidence: edgeConfidence(edge, t.complete && o.complete),
+        reasons,
+      });
+    }
+  }
+
+  return edges
+    .filter(e => e.edge >= EDGE_C)
+    .sort((a, b) => b.edge - a.edge)
+    .slice(0, 6);
+}
 
 export function analyzeFavorites(games: Game[]): TopPick[] {
   const picks: (TopPick & { score: number })[] = [];
@@ -229,11 +431,22 @@ export function analyzeTotals(games: Game[]): TotalPick[] {
   return picks.sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
-export function buildParlays(games: Game[], topPicks: TopPick[], topKProps: KProp[], topTotals: TotalPick[] = []): Parlay[] {
+export function buildParlays(edges: ModelEdge[], topKProps: KProp[], topTotals: TotalPick[] = []): Parlay[] {
   const parlays: Parlay[] = [];
 
-  const mlOdds = topPicks.slice(0, 3).map(p => p.ml);
-  const mlLabels = topPicks.slice(0, 3).map(p => `${p.team} ML (${formatOdds(p.ml)})`);
+  // Moneyline legs come from the model-edge layer (strongest positive edges),
+  // capped at one leg per game so a same-game pair can't create correlated
+  // legs (both teams of one game are never in the same parlay).
+  const mlEdges: ModelEdge[] = [];
+  const seenGames = new Set<string>();
+  for (const e of edges) {
+    if (seenGames.has(e.gameId)) continue;
+    seenGames.add(e.gameId);
+    mlEdges.push(e);
+    if (mlEdges.length >= 3) break;
+  }
+  const mlOdds = mlEdges.map(e => e.ml);
+  const mlLabels = mlEdges.map(e => `${e.team} ML (${formatOdds(e.ml)})`);
 
   // Estimate K prop odds
   const estimateKOdds = (prop: KProp): number => {
@@ -246,10 +459,10 @@ export function buildParlays(games: Game[], topPicks: TopPick[], topKProps: KPro
   const kOdds = topKProps.slice(0, 2).map(estimateKOdds);
   const kLabels = topKProps.slice(0, 2).map((p, i) => `${p.pitcher} Over 6.5 Ks (${formatOdds(kOdds[i])})`);
 
-  // Parlay 1: Top 3 ML
+  // Parlay 1: Top 3 ML (from model edges)
   if (mlOdds.length >= 3) {
     const p = calculateParlayPayout(mlOdds.slice(0, 3));
-    parlays.push({ name: "Top 3 Moneyline Favorites", legs: mlLabels.slice(0, 3), ...p });
+    parlays.push({ name: "Top 3 Model Edge MLs", legs: mlLabels.slice(0, 3), ...p });
   }
 
   // Parlay 2: 2 ML + 1 K
@@ -274,9 +487,9 @@ export function buildParlays(games: Game[], topPicks: TopPick[], topKProps: KPro
   // avoid correlated legs, e.g. a team ML + that same game's total)
   if (mlOdds.length >= 2 && topTotals.length >= 1) {
     const mlTeams = new Set<string>();
-    for (const p of topPicks.slice(0, 2)) {
-      mlTeams.add(p.team);
-      mlTeams.add(p.opponent);
+    for (const e of mlEdges.slice(0, 2)) {
+      mlTeams.add(e.team);
+      mlTeams.add(e.opponent);
     }
     const tp =
       topTotals.find(t => !mlTeams.has(t.away) && !mlTeams.has(t.home)) ??

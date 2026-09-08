@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { fetchScoreboard, fetchGameOdds, TEAM_MAP } from "@/lib/espn";
 import { fetchTodaysPitchers, matchGameToMlbSchedule, fetchPitcherStats, fetchTeamTrends } from "@/lib/mlb";
-import { analyzeFavorites, analyzeKProps, analyzeTotals, buildParlays } from "@/lib/analysis";
+import { analyzeFavorites, analyzeKProps, analyzeTotals, buildParlays, computeModelEdges } from "@/lib/analysis";
 import type { Game, AnalysisResult } from "@/lib/types";
 
 export const revalidate = 300;
@@ -169,14 +169,16 @@ export async function GET(request: Request) {
     }
 
     // 6. Run analysis (only games with odds data)
+    const edges = computeModelEdges(gamesWithOdds);
     const topPicks = analyzeFavorites(gamesWithOdds);
     const topKProps = analyzeKProps(gamesWithOdds);
     const topTotals = analyzeTotals(gamesWithOdds);
-    const parlays = buildParlays(gamesWithOdds, topPicks, topKProps, topTotals);
+    const parlays = buildParlays(edges, topKProps, topTotals);
 
     const result: AnalysisResult = {
       date: today,
       games: gamesWithOdds,
+      edges,
       topPicks,
       topKProps,
       topTotals,

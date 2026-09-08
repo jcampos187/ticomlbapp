@@ -8,7 +8,7 @@ import {
   fetchNflTeamStats,
   nflWeekLabel,
 } from "@/lib/nfl";
-import { analyzeNflFavorites, analyzeNflAts, analyzeNflTotals, analyzeNflProps, buildNflParlays } from "@/lib/nflAnalysis";
+import { analyzeNflFavorites, analyzeNflAts, analyzeNflTotals, analyzeNflProps, buildNflParlays, computeNflModelEdges } from "@/lib/nflAnalysis";
 import type { NflGame, NflPropCandidate, NflAnalysisResult } from "@/lib/nflTypes";
 
 export const revalidate = 300;
@@ -175,11 +175,12 @@ export async function GET(request: Request) {
 
     // 10. Run analysis (only games with odds, and exclude final games).
     const analyzable = games.filter(g => g.status !== "final");
+    const edges = computeNflModelEdges(analyzable);
     const topPicks = analyzeNflFavorites(analyzable);
     const topAts = analyzeNflAts(analyzable);
     const topTotals = analyzeNflTotals(analyzable);
     const topProps = analyzeNflProps(analyzable);
-    const parlays = buildNflParlays(topPicks, topAts, topTotals);
+    const parlays = buildNflParlays(edges, topAts, topTotals);
 
     const result: NflAnalysisResult = {
       date: new Date().toISOString().slice(0, 10),
@@ -188,6 +189,7 @@ export async function GET(request: Request) {
       seasonType: ctx.seasonType,
       seasonYear: ctx.seasonYear,
       games,
+      edges,
       topPicks,
       topAts,
       topTotals,
