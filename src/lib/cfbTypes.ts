@@ -34,7 +34,16 @@ export interface CfbTopPick {
   team: string;
   opponent: string;
   ml: number;
+  /** Raw implied probability from odds (includes vig). Kept for backward compat. */
   impliedProb: number;
+  /** De-vigged fair market probability (0–100). */
+  fairMarketProb: number;
+  /** Model win probability, normalized so both sides sum to 100%. */
+  modelProb: number;
+  /** Edge = model probability − fair market probability (percentage points). */
+  edge: number;
+  /** Expected value = (modelProb × decimalOdds) − 1, as a percentage. */
+  ev: number;
   reasons: string[];
 }
 

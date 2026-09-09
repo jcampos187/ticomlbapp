@@ -314,6 +314,7 @@ function ModelEdgeCard({ edge, index }: { edge: CfbAnalysisResult["edges"][0]; i
 }
 
 function CfbPickCard({ pick, index }: { pick: CfbAnalysisResult["topPicks"][0]; index: number }) {
+  const isHighEdge = Math.abs(pick.edge) >= 10;
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 80}ms` }}>
       <div className="flex items-center justify-between mb-2">
@@ -322,9 +323,33 @@ function CfbPickCard({ pick, index }: { pick: CfbAnalysisResult["topPicks"][0]; 
       </div>
       <div className="text-lg font-bold mb-1">{pick.team}</div>
       <div className="text-sm text-muted mb-2">vs {pick.opponent}</div>
-      <div className="flex items-center gap-2 text-xs text-muted mb-2">
-        <span className="bg-slate-700 px-2 py-0.5 rounded">{pick.impliedProb}% implied</span>
+      <div className="space-y-1 text-xs mb-2">
+        <div className="flex justify-between">
+          <span className="text-muted">Model</span>
+          <span className="font-medium text-slate-300">{pick.modelProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted">Mkt (fair)</span>
+          <span className="font-medium text-slate-300">{pick.fairMarketProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between border-t border-slate-700 pt-1">
+          <span className="text-muted">Edge</span>
+          <span className="font-bold text-green-400">
+            {pick.edge >= 0 ? "+" : ""}{pick.edge.toFixed(1)}%
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted">EV</span>
+          <span className={`font-bold ${pick.ev >= 0 ? "text-green-400" : "text-red-400"}`}>
+            {pick.ev >= 0 ? "+" : ""}{pick.ev.toFixed(1)}%
+          </span>
+        </div>
       </div>
+      {isHighEdge && (
+        <div className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded mb-2 font-medium">
+          ⚠ HIGH EDGE — needs validation
+        </div>
+      )}
       <div className="flex flex-wrap gap-1">
         {pick.reasons.map((r, i) => (
           <span key={i} className="text-xs bg-slate-700/50 px-2 py-0.5 rounded-full text-slate-300">{r}</span>
@@ -538,7 +563,7 @@ export function CfbDashboard() {
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
                   🎯 Model Edge Picks
-                  <span className="text-xs text-muted font-normal">(model prob − market implied)</span>
+                  <span className="text-xs text-muted font-normal">(model prob − de-vigged market · EV = expected value at sportsbook odds)</span>
                 </h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                   {todayEdges.map((edge, i) => (
@@ -549,7 +574,7 @@ export function CfbDashboard() {
             )}
             {todayPicks.length > 0 && (
               <section>
-                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks</h2>
+                <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks <span className="text-xs text-muted font-normal">(ranked by model edge + EV)</span></h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
                   {todayPicks.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
                 </div>

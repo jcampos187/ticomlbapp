@@ -1,5 +1,5 @@
 import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate, NflModelEdge } from "./nflTypes";
-import { americanToDecimal, formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence } from "./analysis";
+import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability } from "./analysis";
 
 // --- Model Edge: logistic win-probability model vs market implied ---
 // Same structure as MLB but NFL games have no pitcher stats, so the model
@@ -41,30 +41,88 @@ function nflInputs(game: NflGame, side: "away" | "home"): NflModelInputs {
   };
 }
 
-/** Logistic win probability (%) for one side of an NFL game. */
-export function nflTeamWinProbability(game: NflGame, side: "away" | "home"): number | null {
-  const ml = side === "away" ? game.awayML : game.homeML;
-  const oppMl = side === "away" ? game.homeML : game.awayML;
-  if (!ml || !oppMl) return null;
-
-  const t = nflInputs(game, side);
-  const o = nflInputs(game, side === "away" ? "home" : "away");
-
-  let z = side === "home" ? NFL_HOME_ADV : 0;
+/** Raw log-odds (z-score) for one side of an NFL game — NOT a probability. */
+function nflRawLogit(t: NflModelInputs, o: NflModelInputs, isHome: boolean): number {
+  let z = isHome ? NFL_HOME_ADV : 0;
   z += (t.winRate - o.winRate) * NFL_COEF_WIN_RATE;
   z += (t.ppg - o.ppg) * NFL_COEF_PPG;
+  return z;
+}
 
-  return Math.min(0.97, Math.max(0.03, sigmoid(z))) * 100;
+/**
+ * Compute normalised model probabilities (%) for both sides of an NFL game.
+ *
+ * Raw logits are converted to odds-ratio space via sigmoid, then normalised
+ * so that P(away) + P(home) = 100%. Computing independent sigmoids allowed
+ * P(away) + P(home) to drift away from 100%; normalising keeps the model a
+ * true two-outcome distribution.
+ */
+export function computeNflNormProbs(game: NflGame): {
+  awayProb: number;
+  homeProb: number;
+  awayInputs: NflModelInputs;
+  homeInputs: NflModelInputs;
+} | null {
+  const awayML = game.awayML;
+  const homeML = game.homeML;
+  if (!awayML || !homeML) return null;
+
+  const t = nflInputs(game, "away");
+  const o = nflInputs(game, "home");
+
+  const awayRawLogit = nflRawLogit(t, o, false);
+  const homeRawLogit = nflRawLogit(o, t, true);
+
+  // Odds-ratio space, then normalise so both sides sum to exactly 100%.
+  const eAway = sigmoid(awayRawLogit);
+  const eHome = sigmoid(homeRawLogit);
+  const total = eAway + eHome;
+
+  // Clamp to [3%, 97%] to avoid displaying extreme probabilities.
+  const awayProb = Math.min(0.97, Math.max(0.03, eAway / total)) * 100;
+  const homeProb = 100 - awayProb; // guaranteed to sum to exactly 100
+
+  return { awayProb, homeProb, awayInputs: t, homeInputs: o };
+}
+
+/**
+ * Logistic win probability (%) for one side of an NFL game.
+ *
+ * NOTE: This uses the normalised approach so both sides always sum to 100%.
+ * Returns null when there's no moneyline on the game (no odds = no bettable
+ * game).
+ */
+export function nflTeamWinProbability(game: NflGame, side: "away" | "home"): number | null {
+  const probs = computeNflNormProbs(game);
+  if (!probs) return null;
+  return side === "away" ? probs.awayProb : probs.homeProb;
 }
 
 /**
  * Compute the model edge for every NFL team with a moneyline and surface the
  * positive ones (model likes the team more than the market does).
+ *
+ * Model probabilities are NORMALISED (both sides sum to 100%) and market
+ * probabilities are DE-VIGGED (both sides sum to 100%), so the edge is
+ * model vs fair market.
  */
 export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
   const edges: NflModelEdge[] = [];
 
   for (const game of games) {
+    const probs = computeNflNormProbs(game);
+    if (!probs) continue;
+
+    // No meaningful model data on either side (0-0 records, null PPG — e.g.
+    // preseason) means every "edge" would just be 50% vs the market price:
+    // noise, not signal. Skip these games entirely.
+    if (!probs.awayInputs.complete && !probs.homeInputs.complete) continue;
+
+    // De-vig the market
+    const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
+    const fairHome = fairMarketProbability(game.awayML, game.homeML, "home");
+    if (fairAway == null || fairHome == null) continue;
+
     for (const side of ["away", "home"] as const) {
       const team = side === "away" ? game.awayTeam : game.homeTeam;
       const abbrev = side === "away" ? game.awayAbbrev : game.homeAbbrev;
@@ -72,20 +130,13 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
       const ml = side === "away" ? game.awayML : game.homeML;
       if (!ml) continue;
 
-      // No meaningful model data on either side (0-0 records, null PPG — e.g.
-      // preseason) means every "edge" would just be 50% vs the market price:
-      // noise, not signal. Skip these games entirely.
-      const t = nflInputs(game, side);
-      const o = nflInputs(game, side === "away" ? "home" : "away");
-      if (!t.complete && !o.complete) continue;
-
-      const modelProb = nflTeamWinProbability(game, side);
-      if (modelProb == null) continue;
-
-      const fairMkt = fairMarketProbability(game.awayML, game.homeML, side);
-      if (fairMkt == null) continue;
+      const modelProb = side === "away" ? probs.awayProb : probs.homeProb;
+      const fairMkt = side === "away" ? fairAway : fairHome;
       const edge = modelProb - fairMkt;
       const ev = expectedValue(modelProb, ml) * 100;
+
+      const t = side === "away" ? probs.awayInputs : probs.homeInputs;
+      const o = side === "away" ? probs.homeInputs : probs.awayInputs;
 
       const reasons: string[] = [];
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
@@ -121,58 +172,95 @@ const SHARP_MOVE_CENTS = 20;
 const MILD_MOVE_CENTS = 10;
 const SHARP_SPREAD_MOVE = 1; // spread moved a full point toward a team
 
-// --- Moneyline favorites ---
+// Large edges (>10pp) are flagged as needing validation because they may
+// indicate either a genuine opportunity or a model/data problem.
+const HIGH_EDGE_THRESHOLD = 10;
+
+// --- Moneyline picks — ranked by model edge + EV (not just odds magnitude)
+// Same structure as MLB's analyzeFavorites: both sides of each game are
+// evaluated, an underdog with positive EV beats a heavy favorite with
+// negative EV, and the score weights model edge first.
 export function analyzeNflFavorites(games: NflGame[]): NflTopPick[] {
   const picks: (NflTopPick & { score: number })[] = [];
 
   for (const game of games) {
-    if (!game.awayML && !game.homeML) continue;
+    const probs = computeNflNormProbs(game);
+    if (!probs) continue;
 
-    const favML = game.awayML < 0 ? game.awayML : game.homeML;
-    const favTeam = game.awayML < 0 ? game.awayTeam : game.homeTeam;
-    const dogTeam = game.awayML < 0 ? game.homeTeam : game.awayTeam;
-    const isHome = game.homeML < 0;
-    const impliedProb = (1 / americanToDecimal(favML)) * 100;
+    const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
+    const fairHome = fairMarketProbability(game.awayML, game.homeML, "home");
+    if (fairAway == null || fairHome == null) continue;
 
-    const record = isHome ? game.homeRecord : game.awayRecord;
-    const [w, l] = record.split("-").map(Number);
-    const winPct = w + l > 0 ? (w / (w + l)) * 100 : 0;
+    // Evaluate both sides — an underdog with positive EV is a better bet
+    // than a heavy favorite with negative EV.
+    const sides = [
+      { side: "away" as const, team: game.awayTeam, opponent: game.homeTeam, ml: game.awayML, modelProb: probs.awayProb, fairMkt: fairAway },
+      { side: "home" as const, team: game.homeTeam, opponent: game.awayTeam, ml: game.homeML, modelProb: probs.homeProb, fairMkt: fairHome },
+    ];
 
-    let score = 0;
-    const reasons: string[] = [];
+    for (const s of sides) {
+      if (!s.ml) continue;
 
-    if (favML <= -120) { score += 1; reasons.push(`${formatOdds(favML)} favorite`); }
-    if (favML <= -150) { score += 2; reasons.push("Strong favorite"); }
-    if (favML <= -200) { score += 3; reasons.push("Heavy favorite"); }
-    if (isHome) { score += 1; reasons.push("Home field"); }
-    if (winPct > 55) { score += 1; reasons.push(`${winPct.toFixed(0)}% win rate`); }
-    if (winPct > 65) score += 1;
+      const edge = s.modelProb - s.fairMkt;
+      const ev = expectedValue(s.modelProb, s.ml) * 100; // as percentage
 
-    // Line movement toward the favorite = sharp money
-    const awayIsFav = game.awayML < 0;
-    const favOpen = awayIsFav ? game.awayMLOpen : game.homeMLOpen;
-    if (favOpen) {
-      const move = favML - favOpen;
-      if (move <= -SHARP_MOVE_CENTS) {
-        score += 2;
-        reasons.push(`Sharp money (ML ${formatOdds(favOpen)} → ${formatOdds(favML)})`);
-      } else if (move <= -MILD_MOVE_CENTS) {
-        score += 1;
-        reasons.push(`ML moved ${formatOdds(favOpen)} → ${formatOdds(favML)}`);
-      }
+      // Only include picks with positive edge (model disagrees with market)
+      if (edge <= 0) continue;
+
+      // Line movement signal (this side's own open → current)
+      const isHome = s.side === "home";
+      const open = isHome ? game.homeMLOpen : game.awayMLOpen;
+      const lineMoveBonus = (() => {
+        if (!open) return 0;
+        const move = s.ml - open;
+        if (move <= -SHARP_MOVE_CENTS) return 3; // sharp money on this side
+        if (move <= -MILD_MOVE_CENTS) return 1;
+        return 0;
+      })();
+
+      // Score: edge is the primary factor, EV confirms it, data quality
+      // adds confidence. Odds magnitude alone does NOT drive the score.
+      const score =
+        edge * 0.5 +           // model edge (pp)
+        Math.max(0, ev) * 0.3 + // positive EV bonus
+        (probs.awayInputs.complete && probs.homeInputs.complete ? 1.5 : 0) + // data quality
+        lineMoveBonus; // sharp money signal
+
+      const reasons: string[] = [];
+      reasons.push(`Edge +${edge.toFixed(1)}%`);
+      reasons.push(`EV ${ev >= 0 ? "+" : ""}${ev.toFixed(1)}%`);
+      if (edge >= HIGH_EDGE_THRESHOLD) reasons.push("⚠ HIGH EDGE — needs validation");
+      if (s.modelProb > 60) reasons.push(`Model ${s.modelProb.toFixed(1)}%`);
+      if (s.ml <= -150) reasons.push(`${formatOdds(s.ml)} favorite`);
+      if (s.ml > 0) reasons.push(`${formatOdds(s.ml)} underdog`);
+      if (lineMoveBonus >= 2) reasons.push("Sharp money");
+
+      picks.push({
+        team: s.team,
+        opponent: s.opponent,
+        ml: s.ml,
+        impliedProb: Math.round(marketProbability(s.ml) * 10) / 10,
+        fairMarketProb: Math.round(s.fairMkt * 10) / 10,
+        modelProb: Math.round(s.modelProb * 10) / 10,
+        edge: Math.round(edge * 10) / 10,
+        ev: Math.round(ev * 10) / 10,
+        reasons,
+        score,
+      });
     }
-
-    picks.push({
-      team: favTeam,
-      opponent: dogTeam,
-      ml: favML,
-      impliedProb: Math.round(impliedProb * 10) / 10,
-      reasons,
-      score,
-    });
   }
 
-  return picks.sort((a, b) => b.score - a.score).filter(p => p.score >= 2).slice(0, 5);
+  // Sort by score (edge-weighted), not by odds magnitude.
+  // Take top 5 by score, ensuring no duplicate teams.
+  const seen = new Set<string>();
+  return picks
+    .sort((a, b) => b.score - a.score)
+    .filter(p => {
+      if (seen.has(p.team)) return false;
+      seen.add(p.team);
+      return true;
+    })
+    .slice(0, 5);
 }
 
 // --- Against the spread ---
