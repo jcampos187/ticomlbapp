@@ -1,5 +1,6 @@
 import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate, NflModelEdge } from "./nflTypes";
 import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability } from "./analysis";
+import calibration from "./calibration-nfl.json";
 
 // --- Model Edge: logistic win-probability model vs market implied ---
 // Same structure as MLB but NFL games have no pitcher stats, so the model
@@ -41,6 +42,17 @@ function nflInputs(game: NflGame, side: "away" | "home"): NflModelInputs {
   };
 }
 
+/**
+ * Apply Platt scaling calibration to a raw logit (fitted by the backtest
+ * script for NFL; see `calibration-nfl.json`, generated via `npm run
+ * backtest -- --sport nfl`). A≈0.64 < 1 means the raw logits are
+ * overconfident — calibration compresses them toward 50%.
+ */
+function calibrateLogit(rawLogit: number): number {
+  const { A, B } = calibration.plattScaling;
+  return A * rawLogit + B;
+}
+
 /** Raw log-odds (z-score) for one side of an NFL game — NOT a probability. */
 function nflRawLogit(t: NflModelInputs, o: NflModelInputs, isHome: boolean): number {
   let z = isHome ? NFL_HOME_ADV : 0;
@@ -73,9 +85,10 @@ export function computeNflNormProbs(game: NflGame): {
   const awayRawLogit = nflRawLogit(t, o, false);
   const homeRawLogit = nflRawLogit(o, t, true);
 
-  // Odds-ratio space, then normalise so both sides sum to exactly 100%.
-  const eAway = sigmoid(awayRawLogit);
-  const eHome = sigmoid(homeRawLogit);
+  // Apply Platt scaling calibration to the raw logits before normalisation.
+  // This corrects systematic biases in the model's probability outputs.
+  const eAway = sigmoid(calibrateLogit(awayRawLogit));
+  const eHome = sigmoid(calibrateLogit(homeRawLogit));
   const total = eAway + eHome;
 
   // Clamp to [3%, 97%] to avoid displaying extreme probabilities.

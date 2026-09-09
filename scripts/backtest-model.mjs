@@ -1,16 +1,28 @@
 #!/usr/bin/env node
 /**
- * backtest-model.mjs — Validate the MLB betting model against historical results.
+ * backtest-model.mjs — Validate the betting models against historical results.
  *
- * Fetches completed MLB games from the Stats API (free, no key), rebuilds
- * team stats and pitcher stats as they would have been known at game time,
- * runs the logistic model, and compares predictions to actual outcomes.
+ * Supports all three sports the app models:
+ *   MLB  — fetches completed games from the MLB Stats API (free, no key),
+ *          rebuilding team + pitcher stats as known at game time.
+ *   CFB/NFL — fetches completed games from ESPN's scoreboard (free, no key)
+ *          using the same endpoints the app already calls. Records are
+ *          reconstructed to their pre-game values and PPG uses the season
+ *          averages ESPN reports, mirroring what the model sees in production.
+ *
+ * Each sport runs its own logistic model, compares predictions to actual
+ * outcomes, and fits Platt-scaling calibration parameters (A, B) that get
+ * saved to a per-sport calibration file the production models load:
+ *     MLB  → src/lib/calibration.json
+ *     CFB  → src/lib/calibration-cfb.json
+ *     NFL  → src/lib/calibration-nfl.json
  *
  * Usage:
- *     node scripts/backtest-model.mjs                       # last 30 days
- *     node scripts/backtest-model.mjs --days 60             # last 60 days
- *     node scripts/backtest-model.mjs --from 2025-06-01 --to 2025-06-30
- *     node scripts/backtest-model.mjs --sample 50           # print 50 game details
+ *     node scripts/backtest-model.mjs                                   # MLB, last 30 days
+ *     node scripts/backtest-model.mjs --sport cfb                       # CFB, last 30 days
+ *     node scripts/backtest-model.mjs --sport nfl --days 60             # NFL, last 60 days
+ *     node scripts/backtest-model.mjs --sport cfb --from 2025-09-01 --to 2025-09-30
+ *     node scripts/backtest-model.mjs --sample 50                       # print 50 game details
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -109,12 +121,17 @@ function confidenceGrade(edge, complete) {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const out = { days: 30, sample: 0, from: null, to: null };
+  const out = { sport: "mlb", days: 30, sample: 0, from: null, to: null };
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === "--days" && args[i + 1]) out.days = Number(args[++i]);
+    if (args[i] === "--sport" && args[i + 1]) out.sport = args[++i].toLowerCase();
+    else if (args[i] === "--days" && args[i + 1]) out.days = Number(args[++i]);
     else if (args[i] === "--from" && args[i + 1]) out.from = args[++i];
     else if (args[i] === "--to" && args[i + 1]) out.to = args[++i];
     else if (args[i] === "--sample" && args[i + 1]) out.sample = Number(args[++i]);
+  }
+  if (!["mlb", "cfb", "nfl"].includes(out.sport)) {
+    console.error(`Unknown sport "${out.sport}" — expected mlb, cfb, or nfl.`);
+    process.exit(1);
   }
   return out;
 }
@@ -406,10 +423,558 @@ function fitPlattScaling(gamesWithStats) {
 
 function pct(n) { return (n * 100).toFixed(1) + "%"; }
 
+// ─── CFB / NFL (ESPN) — data fetchers ───────────────────────────────────────
+// ESPN's edge fingerprint-checks the User-Agent, so these fetch calls must
+// NOT set a custom UA (the runtime's default is allowed).
+
+const ESPN_BASE = {
+  "college-football": "https://site.api.espn.com/apis/site/v2/sports/football/college-football",
+  "nfl": "https://site.api.espn.com/apis/site/v2/sports/football/nfl",
+};
+
+/** ESPN sport configs — coefficients MUST match src/lib/cfbAnalysis.ts and
+ *  src/lib/nflAnalysis.ts. Each sport backtests its own logistic model and
+ *  writes its own calibration file. */
+const FOOTBALL_CONFIG = {
+  cfb: {
+    label: "CFB",
+    banner: "CFB Model Backtest",
+    calibrationFile: "calibration-cfb.json",
+    moduleLabel: "cfbAnalysis.ts",
+    leagueAvg: { winRate: 0.5, ppg: 28.0 },
+    homeAdv: 0.42,
+    coefWinRate: 3.2,
+    coefPpg: 0.16,
+    api: "college-football",
+  },
+  nfl: {
+    label: "NFL",
+    banner: "NFL Model Backtest",
+    calibrationFile: "calibration-nfl.json",
+    moduleLabel: "nflAnalysis.ts",
+    leagueAvg: { winRate: 0.5, ppg: 23.0 },
+    homeAdv: 0.33,
+    coefWinRate: 3.2,
+    coefPpg: 0.13,
+    api: "nfl",
+  },
+};
+
+/** Fetch one date of ESPN scoreboard events (regular season only). */
+async function espnFetchJson(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
+  return resp.json();
+}
+
+/**
+ * Fetch completed CFB/NFL games for one calendar date. ESPN embeds each
+ * team's current-season record on the competition, but for a completed game
+ * that record INCLUDES the game's own result. We reconstruct the pre-game
+ * record (what the model sees in production) by subtracting this result.
+ */
+async function fetchFootballGames(cfg, date, season) {
+  const ymd = date.replace(/-/g, "");
+  const data = await espnFetchJson(
+    `${ESPN_BASE[cfg.api]}/scoreboard?dates=${ymd}&seasontype=2&season=${season}`
+  );
+  if (!data) return [];
+  const out = [];
+
+  for (const event of data.events || []) {
+    if (event.status?.type?.state !== "post") continue;
+    const comp = event.competitions?.[0];
+    if (!comp) continue;
+    const away = comp.competitors?.find((c) => c.homeAway === "away");
+    const home = comp.competitors?.find((c) => c.homeAway === "home");
+    if (!away || !home) continue;
+
+    const awayScore = Number(away.score ?? 0);
+    const homeScore = Number(home.score ?? 0);
+    if (!awayScore && !homeScore) continue;
+    const homeWinner = homeScore > awayScore;
+
+    // Displayed record is post-game: away won → away W already includes it,
+    // home L already includes it; home won → mirrored.
+    const awayRec = away.records?.[0]?.summary || "";
+    const homeRec = home.records?.[0]?.summary || "";
+    const parse = (s) => {
+      const [w, l] = s.split("-").map(Number);
+      return { w: Number.isFinite(w) ? w : 0, l: Number.isFinite(l) ? l : 0 };
+    };
+    const awayP = parse(awayRec);
+    const homeP = parse(homeRec);
+
+    // Reconstruct pre-game record.
+    let awayPre, homePre;
+    if (homeWinner) {
+      awayPre = `${awayP.w}-${Math.max(0, awayP.l - 1)}`;
+      homePre = `${Math.max(0, homeP.w - 1)}-${homeP.l}`;
+    } else {
+      awayPre = `${Math.max(0, awayP.w - 1)}-${awayP.l}`;
+      homePre = `${homeP.w}-${Math.max(0, homeP.l - 1)}`;
+    }
+
+    out.push({
+      id: String(event.id ?? comp.id),
+      date,
+      awayTeam: away.team?.shortDisplayName || away.team?.displayName || "",
+      homeTeam: home.team?.shortDisplayName || home.team?.displayName || "",
+      awayAbbrev: away.team?.abbreviation || "",
+      homeAbbrev: home.team?.abbreviation || "",
+      awayRecord: awayPre,
+      homeRecord: homePre,
+      awayScore,
+      homeScore,
+      homeWinner,
+      awayTeamId: Number(away.team?.id),
+      homeTeamId: Number(home.team?.id),
+    });
+  }
+  return out;
+}
+
+/** The season a football date belongs to (season runs Aug–Feb). */
+function footballSeason(dateStr) {
+  const [y, m] = dateStr.split("-").map(Number);
+  return m >= 8 ? y : y - 1;
+}
+
+const footballTeamStatCache = new Map();
+
+/** Season points-per-game for a team (site API, same source as the app). */
+async function fetchFootballTeamStats(cfg, teamId, season) {
+  if (!teamId) return null;
+  const key = `${cfg.api}|${teamId}|${season}`;
+  if (footballTeamStatCache.has(key)) return footballTeamStatCache.get(key);
+  const data = await espnFetchJson(
+    `https://site.api.espn.com/apis/site/v2/sports/football/${cfg.api}/teams/${teamId}/statistics?season=${season}`
+  );
+  let ppg = null;
+  try {
+    const cats = data?.results?.stats?.categories || [];
+    const scoring = cats.find((c) => c.name === "scoring");
+    const stat = scoring?.stats?.find((s) => s.name === "totalPointsPerGame");
+    if (stat?.value != null) {
+      const n = Number(stat.value);
+      ppg = Number.isNaN(n) ? null : n;
+    }
+  } catch {
+    ppg = null;
+  }
+  footballTeamStatCache.set(key, ppg);
+  return ppg;
+}
+
+/**
+ * Mirror of computeCfbNormProbs / computeNflNormProbs: raw logits for both
+ * sides → sigmoid → normalise so P(away)+P(home)=100% → clamp to [3,97].
+ * Returns null when either side has too few games to be meaningful.
+ */
+function footballRawLogit(cfg, t, o, isHome) {
+  let z = isHome ? cfg.homeAdv : 0;
+  z += (t.winRate - o.winRate) * cfg.coefWinRate;
+  z += (t.ppg - o.ppg) * cfg.coefPpg;
+  return z;
+}
+
+function runFootballModel(cfg, game, awayPpg, homePpg) {
+  const [aw, al] = (game.awayRecord || "").split("-").map(Number);
+  const [hw, hl] = (game.homeRecord || "").split("-").map(Number);
+  const aGames = Number.isFinite(aw) && Number.isFinite(al) ? aw + al : 0;
+  const hGames = Number.isFinite(hw) && Number.isFinite(hl) ? hw + hl : 0;
+  if (aGames < MIN_EDGE_GAMES || hGames < MIN_EDGE_GAMES) return null;
+
+  const t = {
+    winRate: aw / aGames,
+    ppg: awayPpg ?? cfg.leagueAvg.ppg,
+    complete: awayPpg != null,
+  };
+  const o = {
+    winRate: hw / hGames,
+    ppg: homePpg ?? cfg.leagueAvg.ppg,
+    complete: homePpg != null,
+  };
+
+  const zAway = footballRawLogit(cfg, t, o, false);
+  const zHome = footballRawLogit(cfg, o, t, true);
+  const eAway = sigmoid(zAway);
+  const eHome = sigmoid(zHome);
+  const total = eAway + eHome;
+  const awayProb = Math.min(0.97, Math.max(0.03, eAway / total)) * 100;
+  const homeProb = 100 - awayProb;
+
+  return {
+    awayTeam: game.awayTeam,
+    homeTeam: game.homeTeam,
+    awayProb,
+    homeProb,
+    awayWinRate: t.winRate,
+    homeWinRate: o.winRate,
+    awayPpg: t.ppg,
+    homePpg: o.ppg,
+    complete: t.complete && o.complete,
+    awayScore: game.awayScore ?? 0,
+    homeScore: game.homeScore ?? 0,
+  };
+}
+
+/**
+ * Build the shared backtest report + Platt fit + calibration save for the
+ * football sports. Mirrors the MLB report (identical overall/betting/
+ * calibration tables) minus the pitcher-data-quality section, which doesn't
+ * exist for CFB/NFL.
+ */
+async function reportFootball(cfg, gamesWithStats, from, to, opts) {
+  const total = gamesWithStats.length;
+  const correct = gamesWithStats.filter((g) => g.correct).length;
+  const accuracy = correct / total;
+
+  const brierScores = gamesWithStats.map((g) => {
+    const outcome = g.homeWinner ? 1 : 0;
+    const prob = g.homeProb / 100;
+    return (prob - outcome) ** 2;
+  });
+  const brierScore = brierScores.reduce((a, b) => a + b, 0) / brierScores.length;
+
+  const logLosses = gamesWithStats.map((g) => {
+    const outcome = g.homeWinner ? 1 : 0;
+    const prob = Math.max(0.001, Math.min(0.999, g.homeProb / 100));
+    return -(outcome * Math.log(prob) + (1 - outcome) * Math.log(1 - prob));
+  });
+  const logLoss = logLosses.reduce((a, b) => a + b, 0) / logLosses.length;
+
+  const buckets = {};
+  for (const g of gamesWithStats) {
+    const bucket = Math.round(g.homeProb / 5) * 5;
+    const key = `${bucket}%`;
+    if (!buckets[key]) buckets[key] = { count: 0, homeWins: 0 };
+    buckets[key].count++;
+    if (g.homeWinner) buckets[key].homeWins++;
+  }
+
+  const edgeBuckets = [
+    { label: "0-3%", min: 0, max: 3, count: 0, correct: 0 },
+    { label: "3-5%", min: 3, max: 5, count: 0, correct: 0 },
+    { label: "5-8%", min: 5, max: 8, count: 0, correct: 0 },
+    { label: "8-12%", min: 8, max: 12, count: 0, correct: 0 },
+    { label: "12%+", min: 12, max: 99, count: 0, correct: 0 },
+  ];
+  for (const g of gamesWithStats) {
+    for (const b of edgeBuckets) {
+      if (g.gameEdge >= b.min && g.gameEdge < b.max) {
+        b.count++;
+        if (g.correct) b.correct++;
+      }
+    }
+  }
+
+  const homeGames2 = gamesWithStats.filter((g) => g.homeProb > g.awayProb);
+  const awayGames2 = gamesWithStats.filter((g) => g.awayProb > g.homeProb);
+  const homePickCorrect = homeGames2.filter((g) => g.correct).length;
+  const awayPickCorrect = awayGames2.filter((g) => g.correct).length;
+  const homeAvg = gamesWithStats.reduce((s, g) => s + g.homeProb, 0) / total;
+  const awayAvg = gamesWithStats.reduce((s, g) => s + g.awayProb, 0) / total;
+
+  let bettingProfit = 0;
+  let bettingBets = 0;
+  let winningBets = 0;
+  for (const g of gamesWithStats) {
+    const payout = 10 * (210 / 110);
+    if (g.correct) {
+      bettingProfit += payout - 10;
+      winningBets++;
+    } else {
+      bettingProfit -= 10;
+    }
+    bettingBets++;
+  }
+  const bettingROI = (bettingProfit / (bettingBets * 10)) * 100;
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("                    OVERALL RESULTS");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log(`  Games analyzed:        ${total}`);
+  console.log(`  Model correct picks:   ${correct} / ${total} (${(accuracy * 100).toFixed(1)}%)`);
+  console.log(`  Brier score:           ${brierScore.toFixed(4)}  (0=perfect, 0.25=coin-flip)`);
+  console.log(`  Log-loss:              ${logLoss.toFixed(4)}  (lower=better, <0.69=beats coin-flip)`);
+  console.log("");
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("                    SIMULATED BETTING");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log(`  Strategy:              Flat $10 on model's pick each game`);
+  console.log(`  Total bets:            ${bettingBets}`);
+  console.log(`  Winning bets:          ${winningBets} / ${bettingBets} (${(winningBets / bettingBets * 100).toFixed(1)}%)`);
+  console.log(`  Total P/L:             ${bettingProfit >= 0 ? "+" : ""}$${bettingProfit.toFixed(2)}`);
+  console.log(`  ROI:                   ${bettingROI >= 0 ? "+" : ""}${bettingROI.toFixed(1)}%`);
+  console.log(`  Breakeven win rate:    ${(100 / 2.1).toFixed(1)}% (at -110 vig)`);
+  console.log("");
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("                    PICK DIRECTION");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log(`  Home-favored games:    ${homeGames2.length}`);
+  console.log(`    → Model correct:     ${homePickCorrect} / ${homeGames2.length} (${homeGames2.length > 0 ? (homePickCorrect / homeGames2.length * 100).toFixed(1) : "N/A"}%)`);
+  console.log(`  Away-favored games:    ${awayGames2.length}`);
+  console.log(`    → Model correct:     ${awayPickCorrect} / ${awayGames2.length} (${awayGames2.length > 0 ? (awayPickCorrect / awayGames2.length * 100).toFixed(1) : "N/A"}%)`);
+  console.log(`  Avg home model prob:   ${homeAvg.toFixed(1)}%  (avg away: ${awayAvg.toFixed(1)}%)`);
+  console.log(`  Home-field advantage:  +${(homeAvg - 50).toFixed(1)}pp in model`);
+  console.log("");
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("              ACCURACY BY MODEL CONFIDENCE");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Edge Range   Games   Correct   Accuracy   Interpretation");
+  console.log("  ──────────   ─────   ───────   ────────   ───────────────");
+  for (const b of edgeBuckets) {
+    if (b.count === 0) continue;
+    const acc = (b.correct / b.count * 100).toFixed(1);
+    const bar = "█".repeat(Math.round(b.correct / b.count * 20));
+    console.log(`  ${b.label.padEnd(10)}   ${String(b.count).padStart(5)}   ${String(b.correct).padStart(7)}   ${acc.padStart(6)}%    ${bar}`);
+  }
+  console.log("");
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("                   CALIBRATION");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Model says   Games   Actual Win%   Gap      Calibration");
+  console.log("  ──────────   ─────   ───────────   ────     ────────────");
+  const sortedBuckets = Object.entries(buckets)
+    .map(([k, v]) => ({ prob: parseInt(k), ...v }))
+    .sort((a, b) => a.prob - b.prob);
+  for (const b of sortedBuckets) {
+    if (b.count < 3) continue;
+    const actual = (b.homeWins / b.count * 100).toFixed(1);
+    const gap = (b.homeWins / b.count * 100 - b.prob).toFixed(1);
+    const gapNum = parseFloat(gap);
+    const calib = Math.abs(gapNum) < 3 ? "Good" : Math.abs(gapNum) < 6 ? "Fair" : "Poor";
+    const indicator = gapNum > 0 ? "↑" : gapNum < 0 ? "↓" : "=";
+    console.log(`  ${String(b.prob + "%").padStart(10)}   ${String(b.count).padStart(5)}   ${actual.padStart(9)}%   ${gap.padStart(5)}pp  ${calib} ${indicator}`);
+  }
+  console.log("");
+
+  // ── Platt Scaling Calibration ──────────────────────────────────────
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("            PLATT SCALING CALIBRATION");
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("");
+  console.log("  Fitting calibration on backtest data…");
+
+  const platt = fitPlattScaling(gamesWithStats);
+
+  if (platt) {
+    const brierImprove = ((platt.brierBefore - platt.brierAfter) / platt.brierBefore * 100).toFixed(1);
+    const logLossImprove = ((platt.logLossBefore - platt.logLossAfter) / platt.logLossBefore * 100).toFixed(1);
+
+    console.log(`  Samples:               ${platt.samples} (2 per game: home + away)`);
+    console.log("");
+    console.log(`  Calibration params:    A = ${platt.A.toFixed(6)}, B = ${platt.B.toFixed(6)}`);
+    console.log("");
+    console.log(`  Brier score:           ${platt.brierBefore.toFixed(4)} → ${platt.brierAfter.toFixed(4)}  (${brierImprove >= 0 ? "-" : "+"}${Math.abs(brierImprove).toFixed(1)}% improvement)`);
+    console.log(`  Log-loss:              ${platt.logLossBefore.toFixed(4)} → ${platt.logLossAfter.toFixed(4)}  (${logLossImprove >= 0 ? "-" : "+"}${Math.abs(logLossImprove).toFixed(1)}% improvement)`);
+    console.log("");
+
+    console.log("  Bucket   Before   After    Actual   Before-Gap  After-Gap");
+    console.log("  ──────   ──────   ─────    ──────   ──────────  ─────────");
+    const calData = [];
+    for (const g of gamesWithStats) {
+      const homeLogit = Math.log(g.homeProb / (100 - g.homeProb));
+      const awayLogit = Math.log(g.awayProb / (100 - g.awayProb));
+      calData.push({ logit: homeLogit, outcome: g.homeWinner ? 1 : 0 });
+      calData.push({ logit: awayLogit, outcome: g.homeWinner ? 0 : 1 });
+    }
+    const calBuckets = {};
+    for (const d of calData) {
+      const rawProb = 1 / (1 + Math.exp(-d.logit));
+      const calProb = 1 / (1 + Math.exp(-(platt.A * d.logit + platt.B)));
+      const bucket = Math.round(rawProb * 20) * 5;
+      const key = `${bucket}%`;
+      if (!calBuckets[key]) calBuckets[key] = { raw: [], cal: [], outcomes: [] };
+      calBuckets[key].raw.push(rawProb * 100);
+      calBuckets[key].cal.push(calProb * 100);
+      calBuckets[key].outcomes.push(d.outcome);
+    }
+    for (const [key, bucket] of Object.entries(calBuckets).sort((a, b) => parseInt(a[0]) - parseInt(b[0]))) {
+      if (bucket.outcomes.length < 3) continue;
+      const avgRaw = bucket.raw.reduce((a, b) => a + b, 0) / bucket.raw.length;
+      const avgCal = bucket.cal.reduce((a, b) => a + b, 0) / bucket.cal.length;
+      const actual = bucket.outcomes.reduce((a, b) => a + b, 0) / bucket.outcomes.length * 100;
+      const beforeGap = (actual - avgRaw).toFixed(1);
+      const afterGap = (actual - avgCal).toFixed(1);
+      const afterCalib = Math.abs(parseFloat(afterGap)) < 3 ? "Good" : Math.abs(parseFloat(afterGap)) < 6 ? "Fair" : "Poor";
+      console.log(`  ${key.padStart(6)}   ${avgRaw.toFixed(1)}%    ${avgCal.toFixed(1)}%    ${actual.toFixed(1)}%    ${(parseFloat(beforeGap) >= 0 ? "+" : "") + beforeGap}pp    ${(parseFloat(afterGap) >= 0 ? "+" : "") + afterGap}pp  ${afterCalib}`);
+    }
+
+    console.log("");
+    const calibrationDir = path.join(HERE, "..", "src", "lib");
+    const calibrationPath = path.join(calibrationDir, cfg.calibrationFile);
+    const calibrationData = {
+      version: 1,
+      fittedAt: new Date().toISOString(),
+      trainingPeriod: { from, to },
+      trainingGames: total,
+      trainingSamples: platt.samples,
+      plattScaling: { A: platt.A, B: platt.B },
+      metrics: {
+        brierBefore: platt.brierBefore,
+        brierAfter: platt.brierAfter,
+        logLossBefore: platt.logLossBefore,
+        logLossAfter: platt.logLossAfter,
+      },
+    };
+    await writeFile(calibrationPath, JSON.stringify(calibrationData, null, 2) + "\n");
+    console.log(`  ✓ Calibration saved to ${calibrationPath}`);
+    console.log("");
+    console.log(`  ℹ️  The production model in ${cfg.moduleLabel} will automatically load`);
+    console.log("     these parameters and apply calibration to all future predictions.");
+    console.log("");
+  } else {
+    console.log("  ⚠️  Could not fit calibration — not enough data.");
+    console.log("");
+  }
+
+  if (opts.sample > 0) {
+    console.log("═══════════════════════════════════════════════════════════");
+    console.log(`              SAMPLE GAMES (first ${opts.sample})`);
+    console.log("═══════════════════════════════════════════════════════════\n");
+    for (const g of gamesWithStats.slice(0, opts.sample)) {
+      const pick = g.homeProb > g.awayProb ? g.homeTeam : g.awayTeam;
+      const pickProb = Math.max(g.homeProb, g.awayProb);
+      const edge = Math.abs(g.homeProb - 50);
+      const result = g.correct ? "✓ CORRECT" : "✗ WRONG";
+      console.log(`  ${g.date}  ${g.awayTeam} @ ${g.homeTeam}`);
+      console.log(`    Raw model:  ${g.awayTeam} ${g.awayProb.toFixed(1)}%  |  ${g.homeTeam} ${g.homeProb.toFixed(1)}%`);
+      console.log(`    Pick:       ${pick} (${pickProb.toFixed(1)}%)  Edge: ${edge.toFixed(1)}pp`);
+      console.log(`    Actual:     ${g.homeWinner ? "HOME WIN" : "AWAY WIN"} (${g.homeScore} - ${g.awayScore})`);
+      console.log(`    Result:     ${result}`);
+      console.log("");
+    }
+  }
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("                     VERDICT");
+  console.log("═══════════════════════════════════════════════════════════");
+  if (accuracy >= 0.58 && brierScore < 0.24) {
+    console.log("  🟢 STRONG — Model shows meaningful predictive signal.");
+    console.log("     Consider paper-trading before real money.");
+  } else if (accuracy >= 0.54 && brierScore < 0.245) {
+    console.log("  🟡 PROMISING — Model shows some signal but needs more data.");
+    console.log("     Backtest over a full season before betting real money.");
+  } else if (brierScore >= 0.25) {
+    console.log("  🔴 WEAK — Model is no better than a coin flip (Brier ≥ 0.25).");
+    console.log("     Do NOT bet real money. Retrain coefficients or add features.");
+  } else {
+    console.log("  🟠 MARGINAL — Model has slight signal but likely not profitable");
+    console.log("     after vig. Needs longer backtest and calibration tuning.");
+  }
+  if (platt) {
+    const brierImprove = ((platt.brierBefore - platt.brierAfter) / platt.brierBefore * 100).toFixed(1);
+    console.log(`  📐 Platt scaling calibration: Brier improved ${brierImprove}% (saved to src/lib/${cfg.calibrationFile})`);
+  }
+  console.log("");
+  console.log("  ℹ️  This backtest uses simulated vigged odds (-110). Real");
+  console.log("     closing lines may be sharper. Always validate with real odds.");
+  console.log("");
+}
+
+/** Full CFB/NFL backtest: fetch completed games, rebuild team PPG, run the
+ *  sport's logistic model, and report + fit + save calibration. */
+async function runFootball(opts) {
+  const cfg = FOOTBALL_CONFIG[opts.sport];
+  const today = new Date();
+  let from, to;
+
+  if (opts.from && opts.to) {
+    from = opts.from;
+    to = opts.to;
+  } else {
+    to = today.toISOString().slice(0, 10);
+    const d = new Date(today);
+    d.setDate(d.getDate() - opts.days);
+    from = d.toISOString().slice(0, 10);
+  }
+
+  const dates = dateRange(from, to);
+  console.log(`\n╔══════════════════════════════════════════════════════════╗`);
+  console.log(`║           ${cfg.banner.padEnd(47)}║`);
+  console.log(`║  Period: ${from} → ${to}  (${dates.length} days)`.padEnd(59) + "║");
+  console.log(`╚══════════════════════════════════════════════════════════╝\n`);
+
+  // 1. Fetch all completed games (ESPN regular-season scoreboard).
+  console.log("Phase 1/3: Fetching game data…");
+  const allGames = [];
+  let daysProcessed = 0;
+  for (const date of dates) {
+    const season = footballSeason(date);
+    const games = await fetchFootballGames(cfg, date, season);
+    allGames.push(...games);
+    daysProcessed++;
+    if (daysProcessed % 7 === 0) {
+      process.stdout.write(`  ${daysProcessed}/${dates.length} days fetched (${allGames.length} games)…\r`);
+    }
+  }
+  console.log(`  ✓ ${allGames.length} completed games across ${daysProcessed} days\n`);
+
+  if (allGames.length === 0) {
+    console.log("No completed games found in the specified range.");
+    return;
+  }
+
+  // 2. Fetch team PPG and run the sport model for each game.
+  console.log("Phase 2/3: Fetching team stats and running the model…");
+  const gamesWithStats = [];
+  let statsFetched = 0;
+
+  for (const game of allGames) {
+    const season = footballSeason(game.date);
+    const [awayPpg, homePpg] = await Promise.all([
+      fetchFootballTeamStats(cfg, game.awayTeamId, season),
+      fetchFootballTeamStats(cfg, game.homeTeamId, season),
+    ]);
+
+    const result = runFootballModel(cfg, game, awayPpg, homePpg);
+    if (!result) continue;
+
+    const homeWinner = game.homeWinner;
+    const modelPickHome = result.homeProb > result.awayProb;
+    const correct = modelPickHome === homeWinner;
+    const gameEdge = Math.max(Math.abs(result.homeProb - 50), Math.abs(result.awayProb - 50));
+
+    gamesWithStats.push({
+      ...result,
+      homeWinner,
+      correct,
+      gameEdge,
+      date: game.date,
+    });
+    statsFetched++;
+    if (statsFetched % 40 === 0) {
+      process.stdout.write(`  ${statsFetched}/${allGames.length} games processed…\r`);
+    }
+  }
+  console.log(`  ✓ ${gamesWithStats.length} games with complete model data\n`);
+
+  if (gamesWithStats.length === 0) {
+    console.log("No games had sufficient data for the model. Try a different date range.");
+    return;
+  }
+
+  // 3. Analyze results
+  console.log("Phase 3/3: Analyzing results…\n");
+  await reportFootball(cfg, gamesWithStats, from, to, opts);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
   const opts = parseArgs();
+
+  if (opts.sport !== "mlb") {
+    await runFootball(opts);
+    return;
+  }
+
   const today = new Date();
   let from, to;
 
