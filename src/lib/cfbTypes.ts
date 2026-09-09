@@ -78,11 +78,13 @@ export interface CfbModelEdge {
   gameId: string;
   ml: number;
   home: boolean;
-  modelProb: number; // % (0-100)
-  marketProb: number; // % (0-100)
-  edge: number; // percentage points (model - market)
+  modelProb: number; // % (0-100), normalised
+  fairMarketProb: number; // % (0-100), de-vigged
+  edge: number; // percentage points (model − fair market)
+  ev: number; // expected value as percentage
   confidence: "A" | "B" | "C" | "D";
   reasons: string[];
+  pitcherConfirmed: boolean;
 }
 
 export interface CfbWeekInfo {

@@ -29,13 +29,24 @@ export interface Game {
   homeBullpenEra: number | null;
   awayMLOpen: number | null;
   homeMLOpen: number | null;
+  /** Whether both starting pitchers are confirmed (not TBD). */
+  pitcherConfirmed?: boolean;
 }
 
 export interface TopPick {
   team: string;
   opponent: string;
   ml: number;
+  /** Raw implied probability from odds (includes vig). Kept for backward compat. */
   impliedProb: number;
+  /** De-vigged fair market probability (0–100). Sums to ~100% with the opposing side. */
+  fairMarketProb: number;
+  /** Model win probability, normalized so both sides sum to 100%. */
+  modelProb: number;
+  /** Edge = model probability − fair market probability (percentage points). */
+  edge: number;
+  /** Expected value = (modelProb × decimalOdds) − 1, as a percentage. */
+  ev: number;
   reasons: string[];
 }
 
@@ -66,13 +77,16 @@ export interface Parlay {
   profit: number;
 }
 
+/** Confidence grade for model edges. "A" = large edge + complete data. */
 export type Confidence = "A" | "B" | "C" | "D";
 
 /**
- * Model-vs-market edge for one team in one game. The model probability
- * comes from a logistic win-probability model (records, R/G, starter ERA /
- * K/9, bullpen ERA, home field); the market probability is the raw implied
- * probability of the moneyline. Edge = model - market in percentage points.
+ * Model-vs-market edge for one team in one game.
+ *
+ * - modelProb: normalised logistic win-probability (both sides sum to 100%).
+ * - fairMarketProb: de-vigged market implied probability (both sides sum to 100%).
+ * - edge: modelProb − fairMarketProb (percentage points).
+ * - ev: (modelProb × decimalOdds) − 1, as a percentage — uses actual sportsbook odds.
  */
 export interface ModelEdge {
   team: string;
@@ -82,11 +96,14 @@ export interface ModelEdge {
   gameId: string;
   ml: number;
   home: boolean;
-  modelProb: number; // % (0-100)
-  marketProb: number; // % (0-100)
-  edge: number; // percentage points (model - market)
+  modelProb: number; // % (0–100), normalised across both sides
+  fairMarketProb: number; // % (0–100), de-vigged
+  edge: number; // percentage points (model − fair market)
+  ev: number; // expected value as percentage
   confidence: Confidence;
   reasons: string[];
+  /** True if both pitchers are confirmed. False = TBD pitcher(s) present. */
+  pitcherConfirmed: boolean;
 }
 
 export interface AnalysisResult {

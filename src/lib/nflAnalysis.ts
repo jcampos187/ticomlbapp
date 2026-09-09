@@ -1,5 +1,5 @@
 import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate, NflModelEdge } from "./nflTypes";
-import { americanToDecimal, formatOdds, calculateParlayPayout, sigmoid, marketProbability, edgeConfidence } from "./analysis";
+import { americanToDecimal, formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence } from "./analysis";
 
 // --- Model Edge: logistic win-probability model vs market implied ---
 // Same structure as MLB but NFL games have no pitcher stats, so the model
@@ -82,8 +82,10 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
       const modelProb = nflTeamWinProbability(game, side);
       if (modelProb == null) continue;
 
-      const marketProb = marketProbability(ml);
-      const edge = modelProb - marketProb;
+      const fairMkt = fairMarketProbability(game.awayML, game.homeML, side);
+      if (fairMkt == null) continue;
+      const edge = modelProb - fairMkt;
+      const ev = expectedValue(modelProb, ml) * 100;
 
       const reasons: string[] = [];
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
@@ -98,10 +100,12 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
         ml,
         home: side === "home",
         modelProb: Math.round(modelProb * 10) / 10,
-        marketProb: Math.round(marketProb * 10) / 10,
+        fairMarketProb: Math.round(fairMkt * 10) / 10,
         edge: Math.round(edge * 10) / 10,
+        ev: Math.round(ev * 10) / 10,
         confidence: edgeConfidence(edge, t.complete && o.complete),
         reasons,
+        pitcherConfirmed: true, // NFL has no TBD pitcher concept
       });
     }
   }

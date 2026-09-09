@@ -9,7 +9,8 @@
     "lint": "next lint",
     "capture": "node scripts/capture-picks.mjs",
     "grade": "node scripts/grade-picks.mjs",
-    "tracker": "node scripts/serve-tracker.mjs --open"
+    "tracker": "node scripts/serve-tracker.mjs --open",
+    "backtest": "node scripts/backtest-model.mjs"
   },
   "dependencies": {
     "next": "^14.2.0",

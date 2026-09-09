@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { CfbAnalysisResult } from "@/lib/cfbTypes";
-import { formatOdds, americanToDecimal } from "@/lib/analysis";
+import { formatOdds, fairMarketProbability } from "@/lib/analysis";
 import { cfbTeamWinProbability } from "@/lib/cfbAnalysis";
 import { GameTime } from "@/components/GameTime";
 
@@ -34,16 +34,16 @@ function LineMove({ current, open }: { current: number; open: number | null }) {
 function EdgeRow({ game, side }: { game: CfbAnalysisResult["games"][0]; side: "away" | "home" }) {
   const modelProb = cfbTeamWinProbability(game, side);
   if (modelProb == null) return null;
-  const ml = side === "away" ? game.awayML : game.homeML;
-  const marketProb = (1 / americanToDecimal(ml)) * 100;
-  const edge = modelProb - marketProb;
+  const fairMkt = fairMarketProbability(game.awayML, game.homeML, side);
+  if (fairMkt == null) return null;
+  const edge = modelProb - fairMkt;
   const edgeCls = edge >= 3 ? "text-green-400" : edge <= -3 ? "text-red-400" : "text-muted";
   return (
     <div className="flex items-center justify-between text-xs text-muted mt-0.5">
       <span>
         Model <b className="text-slate-300">{modelProb.toFixed(1)}%</b>
         <span className="mx-1">·</span>
-        Mkt <b className="text-slate-300">{marketProb.toFixed(1)}%</b>
+        Fair Mkt <b className="text-slate-300">{fairMkt.toFixed(1)}%</b>
       </span>
       <span className={`font-bold ${edgeCls}`}>
         Edge {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
@@ -293,7 +293,7 @@ function ModelEdgeCard({ edge, index }: { edge: CfbAnalysisResult["edges"][0]; i
         </div>
         <div className="flex justify-between text-sm py-1">
           <span className="text-muted">Market probability</span>
-          <span className="font-medium">{edge.marketProb.toFixed(1)}%</span>
+          <span className="font-medium">{edge.fairMarketProb.toFixed(1)}%</span>
         </div>
         <div className="flex justify-between text-sm py-1 border-t border-slate-700">
           <span className="text-muted">Edge</span>

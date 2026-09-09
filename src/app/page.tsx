@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { AnalysisResult } from "@/lib/types";
-import { formatOdds, americanToDecimal, teamWinProbability } from "@/lib/analysis";
+import { formatOdds, americanToDecimal, teamWinProbability, fairMarketProbability, expectedValue, computeNormModelProbs } from "@/lib/analysis";
 import { GameTime } from "@/components/GameTime";
 import { NflDashboard } from "@/components/NflDashboard";
 import { CfbDashboard } from "@/components/CfbDashboard";
@@ -48,25 +48,38 @@ function StatBar({ label, value }: { label: string; value: string }) {
 
 /**
  * Compact model-vs-market line under each team in a game card:
- *   Model 77.2% · Mkt 65.8% · Edge +11.4%
- * The full confidence grade shows in the Model Edge Picks section.
+ *   Model 56.1% · Mkt 43.6% · Edge +12.5% · EV +22.8%
+ *
+ * Model probability is NORMALISED via softmax (both sides sum to 100%).
+ * Market probability is DE-VIGGED (both sides sum to 100%).
+ * Edge = model − fair market.  EV uses actual sportsbook odds.
  */
 function EdgeRow({ game, side }: { game: AnalysisResult["games"][0]; side: "away" | "home" }) {
-  const modelProb = teamWinProbability(game, side);
-  if (modelProb == null) return null;
+  const probs = computeNormModelProbs(game);
+  if (!probs) return null;
+  const modelProb = side === "away" ? probs.awayProb : probs.homeProb;
   const ml = side === "away" ? game.awayML : game.homeML;
-  const marketProb = (1 / americanToDecimal(ml)) * 100;
-  const edge = modelProb - marketProb;
+  if (!ml) return null;
+  const fairMkt = fairMarketProbability(game.awayML, game.homeML, side);
+  if (fairMkt == null) return null;
+  const edge = modelProb - fairMkt;
+  const ev = expectedValue(modelProb, ml) * 100;
   const edgeCls = edge >= 3 ? "text-green-400" : edge <= -3 ? "text-red-400" : "text-muted";
+  const evCls = ev >= 0 ? "text-green-400" : "text-red-400";
   return (
     <div className="flex items-center justify-between text-xs text-muted mt-0.5">
       <span>
         Model <b className="text-slate-300">{modelProb.toFixed(1)}%</b>
         <span className="mx-1">·</span>
-        Mkt <b className="text-slate-300">{marketProb.toFixed(1)}%</b>
+        Mkt <b className="text-slate-300">{fairMkt.toFixed(1)}%</b>
       </span>
-      <span className={`font-bold ${edgeCls}`}>
-        Edge {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+      <span className="flex items-center gap-2">
+        <span className={`font-bold ${edgeCls}`}>
+          Edge {edge >= 0 ? "+" : ""}{edge.toFixed(1)}%
+        </span>
+        <span className={`font-bold ${evCls}`}>
+          EV {ev >= 0 ? "+" : ""}{ev.toFixed(1)}%
+        </span>
       </span>
     </div>
   );
@@ -279,9 +292,11 @@ const CONFIDENCE_CLS: Record<string, string> = {
 };
 
 function ModelEdgeCard({ edge, index }: { edge: AnalysisResult["edges"][0]; index: number }) {
+  const isHighEdge = Math.abs(edge.edge) >= 10;
+  const borderColor = isHighEdge ? "border-l-amber-500" : "border-l-green-500";
   return (
     <div
-      className="glass rounded-xl p-4 card-hover animate-in border-l-4 border-l-green-500"
+      className={`glass rounded-xl p-4 card-hover animate-in border-l-4 ${borderColor}`}
       style={{ animationDelay: `${index * 80}ms` }}
     >
       <div className="flex items-center justify-between mb-2">
@@ -298,14 +313,30 @@ function ModelEdgeCard({ edge, index }: { edge: AnalysisResult["edges"][0]; inde
       <div className="text-sm text-muted mb-3">vs {edge.opponent}</div>
       <div className="space-y-1.5 text-sm mb-3">
         <StatBar label="Model probability" value={`${edge.modelProb.toFixed(1)}%`} />
-        <StatBar label="Market probability" value={`${edge.marketProb.toFixed(1)}%`} />
+        <StatBar label="Fair market" value={`${edge.fairMarketProb.toFixed(1)}%`} />
         <div className="flex justify-between text-sm py-1 border-t border-slate-700">
           <span className="text-muted">Edge</span>
           <span className="font-bold text-green-400">
             {edge.edge >= 0 ? "+" : ""}{edge.edge.toFixed(1)}%
           </span>
         </div>
+        <div className="flex justify-between text-sm py-1">
+          <span className="text-muted">EV</span>
+          <span className={`font-bold ${edge.ev >= 0 ? "text-green-400" : "text-red-400"}`}>
+            {edge.ev >= 0 ? "+" : ""}{edge.ev.toFixed(1)}%
+          </span>
+        </div>
       </div>
+      {isHighEdge && (
+        <div className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded mb-2 font-medium">
+          ⚠ HIGH EDGE — needs validation
+        </div>
+      )}
+      {!edge.pitcherConfirmed && (
+        <div className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded mb-2">
+          ⚠ TBD pitcher(s) — reduced confidence
+        </div>
+      )}
       <div className="flex flex-wrap gap-1">
         {edge.reasons.map((r, i) => (
           <span key={i} className="text-xs bg-slate-700/50 px-2 py-0.5 rounded-full text-slate-300">
@@ -318,6 +349,7 @@ function ModelEdgeCard({ edge, index }: { edge: AnalysisResult["edges"][0]; inde
 }
 
 function PickCard({ pick, index }: { pick: AnalysisResult["topPicks"][0]; index: number }) {
+  const isHighEdge = Math.abs(pick.edge) >= 10;
   return (
     <div className="glass rounded-xl p-4 card-hover animate-in" style={{ animationDelay: `${index * 80}ms` }}>
       <div className="flex items-center justify-between mb-2">
@@ -328,9 +360,33 @@ function PickCard({ pick, index }: { pick: AnalysisResult["topPicks"][0]; index:
       </div>
       <div className="text-lg font-bold mb-1">{pick.team}</div>
       <div className="text-sm text-muted mb-2">vs {pick.opponent}</div>
-      <div className="flex items-center gap-2 text-xs text-muted mb-2">
-        <span className="bg-slate-700 px-2 py-0.5 rounded">{pick.impliedProb}% implied</span>
+      <div className="space-y-1 text-xs mb-2">
+        <div className="flex justify-between">
+          <span className="text-muted">Model</span>
+          <span className="font-medium text-slate-300">{pick.modelProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted">Mkt (fair)</span>
+          <span className="font-medium text-slate-300">{pick.fairMarketProb.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between border-t border-slate-700 pt-1">
+          <span className="text-muted">Edge</span>
+          <span className="font-bold text-green-400">
+            {pick.edge >= 0 ? "+" : ""}{pick.edge.toFixed(1)}%
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted">EV</span>
+          <span className={`font-bold ${pick.ev >= 0 ? "text-green-400" : "text-red-400"}`}>
+            {pick.ev >= 0 ? "+" : ""}{pick.ev.toFixed(1)}%
+          </span>
+        </div>
       </div>
+      {isHighEdge && (
+        <div className="text-xs bg-amber-500/20 text-amber-400 px-2 py-1 rounded mb-2 font-medium">
+          ⚠ HIGH EDGE — needs validation
+        </div>
+      )}
       <div className="flex flex-wrap gap-1">
         {pick.reasons.map((r, i) => (
           <span key={i} className="text-xs bg-slate-700/50 px-2 py-0.5 rounded-full text-slate-300">
@@ -597,7 +653,7 @@ function MlbDashboard() {
         <section>
           <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
             🎯 Model Edge Picks
-            <span className="text-xs text-muted font-normal">(model prob − market implied)</span>
+            <span className="text-xs text-muted font-normal">(model prob − de-vigged market · EV = expected value at sportsbook odds)</span>
           </h2>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
             {data.edges.map((edge, i) => (

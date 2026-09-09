@@ -74,6 +74,11 @@ export async function GET(request: Request) {
       if (awayPitcher?.id) pitcherIds.push(awayPitcher.id);
       if (homePitcher?.id) pitcherIds.push(homePitcher.id);
 
+      // Determine if both pitchers are confirmed (not TBD)
+      const pitcherConfirmed =
+        !!awayPitcherName && awayPitcherName !== "TBD" &&
+        !!homePitcherName && homePitcherName !== "TBD";
+
       games.push({
         id: eg.id,
         startTime: eg.startTime,
@@ -105,6 +110,7 @@ export async function GET(request: Request) {
         homeBullpenEra: null,
         awayMLOpen: odds?.awayMLOpen ?? null,
         homeMLOpen: odds?.homeMLOpen ?? null,
+        pitcherConfirmed,
       });
     }
 
@@ -169,6 +175,8 @@ export async function GET(request: Request) {
     }
 
     // 6. Run analysis (only games with odds data)
+    //    Edges are computed first — they use the normalised model probabilities
+    //    and de-vigged market probabilities internally.
     const edges = computeModelEdges(gamesWithOdds);
     const topPicks = analyzeFavorites(gamesWithOdds);
     const topKProps = analyzeKProps(gamesWithOdds);

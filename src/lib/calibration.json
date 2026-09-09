@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "fittedAt": "2026-09-08T16:36:44.613Z",
+  "trainingPeriod": {
+    "from": "2026-08-09",
+    "to": "2026-09-08"
+  },
+  "trainingGames": 404,
+  "trainingSamples": 808,
+  "plattScaling": {
+    "A": 0.9987579186485244,
+    "B": -3.520286372635709e-18
+  },
+  "metrics": {
+    "brierBefore": 0.22998646790905125,
+    "brierAfter": 0.22998603589046512,
+    "logLossBefore": 0.6516662528084513,
+    "logLossAfter": 0.6516659406956455
+  }
+}
