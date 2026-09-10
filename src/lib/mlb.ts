@@ -197,6 +197,8 @@ export async function fetchPitcherStats(playerId: number): Promise<{
   avgK: number | null;
   over6_5Rate: number | null;
   starts: number;
+  /** Season innings pitched — the sample-size basis for stat regression. */
+  ip: number | null;
   gameLogs: number[];
 }> {
   const result = {
@@ -206,6 +208,7 @@ export async function fetchPitcherStats(playerId: number): Promise<{
     avgK: null as number | null,
     over6_5Rate: null as number | null,
     starts: 0,
+    ip: null as number | null,
     gameLogs: [] as number[],
   };
 
@@ -218,6 +221,7 @@ export async function fetchPitcherStats(playerId: number): Promise<{
       result.era = parseFloat(s.era) || null;
       result.whip = parseFloat(s.whip) || null;
       result.starts = parseInt(s.gamesStarted) || 0;
+      result.ip = parseFloat(s.inningsPitched) || null;
       break;
     }
   }

@@ -62,6 +62,17 @@ const LEAGUE_AVG = {
 // incomplete), so early-season slates never produce confident fake edges.
 const MIN_EDGE_GAMES = 4;
 
+// A starter's ERA/K/9 over a tiny sample (a rookie's 0.56 ERA across 16 IP)
+// is noise, but the model would happily turn it into a huge "edge". Regress
+// pitcher stats toward the league baseline using an innings-pitched prior
+// (empirical Bayes). Each stat gets its own prior because they stabilise at
+// very different rates: ERA needs ~100 IP to be half-trustworthy, K/9 only
+// ~60 IP. A 16-IP rookie keeps ~14% of his numbers; a 100+ IP veteran keeps
+// most of his.
+const PRIOR_IP_ERA = 100; // phantom IP of league-average ERA
+const PRIOR_IP_K9 = 60; // phantom IP of league-average K/9
+const SMALL_SAMPLE_IP = 20; // below this, flag the starter in the UI
+
 // Logistic coefficients. Each feature contributes to the log-odds z:
 //   z = homeAdv + b1*(winRate diff) + b2*(R/G diff) + b3*(ERA diff)
 //       + b4*(K/9 diff) + b5*(bullpen ERA diff)
@@ -91,6 +102,26 @@ const MAX_FEATURE_LOGIT = {
 
 function clampFeature(term: number, cap: number): number {
   return Math.max(-cap, Math.min(cap, term));
+}
+
+/**
+ * Regress a pitcher stat toward the league average by sample size (innings
+ * pitched). Blends own numbers with the league baseline weighted by
+ * n / (n + priorIp) — the standard empirical-Bayes shrinkage, where priorIp
+ * is the innings count at which a stat is ~50% reliable. Returns the stat
+ * unchanged when there's no innings info to judge the sample by.
+ */
+export function shrinkStat(
+  stat: number | null,
+  ip: number | null,
+  leagueAvg: number,
+  priorIp: number,
+): number | null {
+  if (stat == null) return null;
+  if (ip == null) return stat;
+  const n = Math.max(0, ip);
+  const weight = n / (n + priorIp);
+  return stat * weight + leagueAvg * (1 - weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +177,8 @@ interface TeamModelInputs {
   k9: number;
   bullpenEra: number;
   complete: boolean;
+  /** True when the starter has very few innings — stats were regressed. */
+  smallSample: boolean;
 }
 
 /** Gather the model inputs for one side of a game, filling gaps with league averages. */
@@ -158,19 +191,25 @@ function teamInputs(
   const starterEra = side === "away" ? game.awayEra : game.homeEra;
   const k9 = side === "away" ? game.awayK9 : game.homeK9;
   const bullpenEra = side === "away" ? game.awayBullpenEra : game.homeBullpenEra;
+  const starterIp = side === "away" ? game.awayIp : game.homeIp;
 
   const present = [winRate, runsPerGame, starterEra, k9, bullpenEra]
     .filter((v): v is number => v != null).length;
 
+  // A starter with very few innings gets his ERA/K9 regressed toward the
+  // league baseline — a 0.56 ERA over 16 IP must not move the model 18pp.
+  const smallSample = starterIp != null && starterIp < SMALL_SAMPLE_IP;
+
   return {
     winRate: winRate ?? LEAGUE_AVG.winRate,
     runsPerGame: runsPerGame ?? LEAGUE_AVG.runsPerGame,
-    starterEra: starterEra ?? LEAGUE_AVG.starterEra,
-    k9: k9 ?? LEAGUE_AVG.k9,
+    starterEra: shrinkStat(starterEra, starterIp, LEAGUE_AVG.starterEra, PRIOR_IP_ERA) ?? LEAGUE_AVG.starterEra,
+    k9: shrinkStat(k9, starterIp, LEAGUE_AVG.k9, PRIOR_IP_K9) ?? LEAGUE_AVG.k9,
     bullpenEra: bullpenEra ?? LEAGUE_AVG.bullpenEra,
-    // Strong data = both teams have at least 4 of 5 core stats (counts both
-    // sides, so >= 8 of 10 present).
-    complete: present >= 4,
+    // Strong data = at least 4 of 5 core stats present AND the starter's
+    // sample is big enough to trust (small samples knock the grade down).
+    complete: present >= 4 && !smallSample,
+    smallSample,
   };
 }
 
@@ -431,6 +470,7 @@ export function computeModelEdges(games: Game[]): ModelEdge[] {
       if (tInputs.bullpenEra < oInputs.bullpenEra - 0.3) reasons.push(`BP ERA ${tInputs.bullpenEra.toFixed(2)}`);
       if (side === "home") reasons.push("Home field");
       if (!pitcherConfirmed) reasons.push("⚠ TBD pitcher(s)");
+      if (tInputs.smallSample || oInputs.smallSample) reasons.push("⚠ Small sample — starter stats regressed");
 
       edges.push({
         team,
@@ -610,8 +650,13 @@ export function analyzeTotals(games: Game[]): TotalPick[] {
     let overReasons: string[] = [];
     let underReasons: string[] = [];
 
-    // 1) Starting pitching signal
-    const eras = [game.awayEra, game.homeEra].filter((e): e is number => !!e);
+    // 1) Starting pitching signal (ERA regressed toward league average for
+    //    small samples, same as the edge model — a 16-IP 0.56 ERA is not
+    //    "elite pitching" yet).
+    const eras = [
+      shrinkStat(game.awayEra, game.awayIp, LEAGUE_AVG.starterEra, PRIOR_IP_ERA),
+      shrinkStat(game.homeEra, game.homeIp, LEAGUE_AVG.starterEra, PRIOR_IP_ERA),
+    ].filter((e): e is number => e != null);
     if (eras.length === 2) {
       const avgEra = (eras[0] + eras[1]) / 2;
       if (avgEra <= 3.0) {

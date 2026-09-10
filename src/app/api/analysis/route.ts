@@ -104,6 +104,8 @@ export async function GET(request: Request) {
         homeOver6_5: null,
         awayEra: null,
         homeEra: null,
+        awayIp: null,
+        homeIp: null,
         awayRunsPerGame: null,
         homeRunsPerGame: null,
         awayBullpenEra: null,
@@ -142,12 +144,14 @@ export async function GET(request: Request) {
         game.awayAvgK = awayStats.avgK;
         game.awayOver6_5 = awayStats.over6_5Rate;
         game.awayEra = awayStats.era;
+        game.awayIp = awayStats.ip;
       }
       if (homeStats) {
         game.homeK9 = homeStats.k9;
         game.homeAvgK = homeStats.avgK;
         game.homeOver6_5 = homeStats.over6_5Rate;
         game.homeEra = homeStats.era;
+        game.homeIp = homeStats.ip;
       }
     }
 

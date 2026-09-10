@@ -23,6 +23,9 @@ export interface Game {
   homeOver6_5: number | null;
   awayEra: number | null;
   homeEra: number | null;
+  /** Season innings pitched for each starter — sample-size basis for regressing ERA/K9. */
+  awayIp: number | null;
+  homeIp: number | null;
   awayRunsPerGame: number | null;
   homeRunsPerGame: number | null;
   awayBullpenEra: number | null;
