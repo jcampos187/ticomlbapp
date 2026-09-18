@@ -41,6 +41,20 @@ function nflInputs(game: NflGame, side: "away" | "home"): NflModelInputs {
     complete: winRate != null && ppg != null,
   };
 }
+/**
+ * Whether the model has enough real inputs to compare against a market price.
+ *
+ * DO NOT relax this to "at least one side has some data". Below the
+ * MIN_EDGE_GAMES floor the win-rate term collapses to the 0.5 fallback on both
+ * sides, so the whole model becomes one unbounded PPG term and produces
+ * "edges" like `Giants +295 · model 82.7% · edge +58.4pp · EV +226%`. That is
+ * the absence of a model, not an opportunity — every model-driven section must
+ * fail closed until records clear the floor.
+ */
+function hasModelSignal(probs: ReturnType<typeof computeNflNormProbs>): boolean {
+  if (!probs) return false;
+  return probs.awayInputs.complete || probs.homeInputs.complete;
+}
 
 /**
  * Apply Platt scaling calibration to a raw logit (fitted by the backtest
@@ -128,8 +142,9 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
 
     // No meaningful model data on either side (0-0 records, null PPG — e.g.
     // preseason) means every "edge" would just be 50% vs the market price:
-    // noise, not signal. Skip these games entirely.
-    if (!probs.awayInputs.complete && !probs.homeInputs.complete) continue;
+    // noise, not signal. See hasModelSignal for what happens if this is
+    // relaxed.
+    if (!hasModelSignal(probs)) continue;
 
     // De-vig the market
     const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
@@ -155,6 +170,11 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
       if (t.ppg > o.ppg + 1.5) reasons.push(`${t.ppg.toFixed(1)} PPG offense`);
       if (side === "home") reasons.push("Home field");
+      // One side can clear the floor while the other hasn't. Say why the
+      // confidence grade is reduced rather than just showing a B/C.
+      if (!(t.complete && o.complete)) {
+        reasons.push(`⚠ Thin sample — one side is under ${MIN_EDGE_GAMES} games`);
+      }
 
       edges.push({
         team,
@@ -199,6 +219,12 @@ export function analyzeNflFavorites(games: NflGame[]): NflTopPick[] {
   for (const game of games) {
     const probs = computeNflNormProbs(game);
     if (!probs) continue;
+
+    // Same data gate as the edge layer. Without it this section surfaced
+    // `Giants +295 · model 82.7% · EV +226%` in week 2 — the model's inputs
+    // were league-average fallbacks, so the "edge" was a fallback vs a sharp
+    // price, not a prediction.
+    if (!hasModelSignal(probs)) continue;
 
     const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
     const fairHome = fairMarketProbability(game.awayML, game.homeML, "home");

@@ -115,23 +115,93 @@ export async function fetchCfbContext(): Promise<CfbWeekInfo> {
 }
 
 /**
- * Fetch the scoreboard for a specific week. ESPN's `?week=N` param silently
- * caps the response at 25 games, so when we have the week's date range we
- * query by `dates=start-end` instead, which returns the full slate.
+ * Every day (YYYYMMDD) from start to end inclusive.
+ *
+ * Capped so a malformed date range from the season calendar can't turn into an
+ * unbounded number of upstream requests.
  */
+function eachDay(start: string, end: string, maxDays = 8): string[] {
+  const first = new Date(`${start}T00:00:00Z`);
+  const last = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(first.getTime()) || Number.isNaN(last.getTime()) || last < first) return [];
+
+  const days: string[] = [];
+  for (const d = new Date(first); d <= last && days.length < maxDays; d.setUTCDate(d.getUTCDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+  }
+  return days;
+}
+
+/**
+ * Fetch every event in a week.
+ *
+ * ESPN's CFB scoreboard accepts three query shapes, and this route has now been
+ * broken by two of them:
+ *
+ *   `?week=N`        valid, but silently caps at ~25 games. Week 3 of 2026 has
+ *                    75, so it drops 53 of them.
+ *   `?dates=A-B`     INVALID for CFB — the range form returns 400 Bad Request,
+ *                    which is what took this tab down in production.
+ *   `?dates=D`       valid, and returns that day's complete slate (a Saturday
+ *                    query comes back with 71 games — no cap).
+ *
+ * So query each day of the week separately, concurrently, and merge by event
+ * id. One failing day is tolerated and logged; if every day fails the upstream
+ * is genuinely down and we throw, rather than returning an empty slate that
+ * looks like a bye week.
+ */
+async function fetchWeekEvents(
+  week: number,
+  seasonYear: number,
+  weekStart?: string,
+  weekEnd?: string,
+): Promise<any[]> {
+  const days = weekStart && weekEnd ? eachDay(weekStart, weekEnd) : [];
+
+  // No usable week range (off-season, or a calendar entry we couldn't read) —
+  // fall back to the week query. It under-reports on a full slate, but it is
+  // better than no schedule at all.
+  if (days.length === 0) {
+    const data = await fetchJson(`${SCOREBOARD_URL}?week=${week}&seasontype=2&season=${seasonYear}`);
+    return data.events || [];
+  }
+
+  const results = await Promise.allSettled(
+    days.map(day =>
+      fetchJson(`${SCOREBOARD_URL}?dates=${day}&seasontype=2&season=${seasonYear}&limit=100`),
+    ),
+  );
+
+  const merged = new Map<string, any>();
+  let failures = 0;
+  results.forEach((result, i) => {
+    if (result.status === "fulfilled") {
+      for (const event of result.value?.events || []) {
+        if (event?.id) merged.set(String(event.id), event);
+      }
+    } else {
+      failures++;
+      console.warn(`CFB scoreboard day query failed (${days[i]}): ${String(result.reason)}`);
+    }
+  });
+
+  if (failures === days.length) {
+    throw new Error(`ESPN CFB scoreboard unavailable: all ${failures} day queries failed`);
+  }
+  return [...merged.values()];
+}
+
+/** Resolve a week's events (all days merged) and shape them into raw games. */
 export async function fetchCfbScoreboard(
   week: number,
   seasonYear: number,
   weekStart?: string,
   weekEnd?: string,
 ): Promise<RawCfbGame[]> {
-  const dateRange = weekStart && weekEnd
-    ? `dates=${weekStart.replace(/-/g, "")}-${weekEnd.replace(/-/g, "")}`
-    : `week=${week}`;
-  const data = await fetchJson(`${SCOREBOARD_URL}?${dateRange}&seasontype=2&season=${seasonYear}`);
+  const events = await fetchWeekEvents(week, seasonYear, weekStart, weekEnd);
   const games: RawCfbGame[] = [];
 
-  for (const event of data.events || []) {
+  for (const event of events) {
     const comp = event.competitions?.[0];
     if (!comp) continue;
 

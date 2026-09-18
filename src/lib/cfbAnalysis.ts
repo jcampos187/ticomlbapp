@@ -44,6 +44,24 @@ function cfbInputs(game: CfbGame, side: "away" | "home"): CfbModelInputs {
 }
 
 /**
+ * Whether the model has enough real inputs to compare against a market price.
+ *
+ * DO NOT relax this to "at least one side has some data". Below the
+ * MIN_EDGE_GAMES floor the win-rate term collapses to the 0.5 fallback on both
+ * sides, which leaves the ENTIRE model as one unbounded PPG term. PPG is not
+ * opponent-adjusted, so in the first weeks — when slates are full of FCS
+ * tune-ups — a 20-30 point PPG gap turns into a 60-90% model probability and
+ * produces "edges" like `UT Martin +4000 · model 46.7% · edge +44.3pp ·
+ * EV +1815%`, and `Giants +295 · model 82.7% · edge +58.4pp`. Those are not
+ * opportunities, they are the absence of a model. Every model-driven section
+ * must fail closed until records clear the floor.
+ */
+function hasModelSignal(probs: ReturnType<typeof computeCfbNormProbs>): boolean {
+  if (!probs) return false;
+  return probs.awayInputs.complete || probs.homeInputs.complete;
+}
+
+/**
  * Apply Platt scaling calibration to a raw logit (fitted by the backtest
  * script for CFB; see `calibration-cfb.json`, generated via `npm run
  * backtest -- --sport cfb`). A≈0.68 < 1 means the raw logits are
@@ -127,10 +145,10 @@ export function computeCfbModelEdges(games: CfbGame[]): CfbModelEdge[] {
     const probs = computeCfbNormProbs(game);
     if (!probs) continue;
 
-    // No meaningful model data on either side (1-2 game records, e.g. the
-    // first weeks of the season) means every "edge" would be noise, not
-    // signal. Skip these games entirely.
-    if (!probs.awayInputs.complete && !probs.homeInputs.complete) continue;
+    // No meaningful model data on either side (records below the floor, e.g.
+    // the first weeks of the season) means every "edge" would be noise, not
+    // signal. See hasModelSignal for what happens when this is relaxed.
+    if (!hasModelSignal(probs)) continue;
 
     // De-vig the market
     const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
@@ -156,6 +174,11 @@ export function computeCfbModelEdges(games: CfbGame[]): CfbModelEdge[] {
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
       if (t.ppg > o.ppg + 2) reasons.push(`${t.ppg.toFixed(1)} PPG offense`);
       if (side === "home") reasons.push("Home field");
+      // One side can clear the floor while the other hasn't. Say why the
+      // confidence grade is reduced rather than just showing a B/C.
+      if (!(t.complete && o.complete)) {
+        reasons.push(`⚠ Thin sample — one side is under ${MIN_EDGE_GAMES} games`);
+      }
 
       edges.push({
         team,
@@ -201,6 +224,12 @@ export function analyzeCfbFavorites(games: CfbGame[]): CfbTopPick[] {
   for (const game of games) {
     const probs = computeCfbNormProbs(game);
     if (!probs) continue;
+
+    // Same data gate as the edge layer. Without it this section happily
+    // surfaced `UT Martin +4000 · model 46.7% · EV +1815%` in week 3: the
+    // model's inputs were entirely league-average fallbacks, so the "edge"
+    // was the fallback vs a sharp price, not a prediction.
+    if (!hasModelSignal(probs)) continue;
 
     const fairAway = fairMarketProbability(game.awayML, game.homeML, "away");
     const fairHome = fairMarketProbability(game.awayML, game.homeML, "home");

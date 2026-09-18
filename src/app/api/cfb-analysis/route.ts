@@ -5,11 +5,52 @@ import type { CfbGame, CfbAnalysisResult } from "@/lib/cfbTypes";
 
 export const revalidate = 300;
 
-/** Cap on team-stat lookups per analysis run. */
-const MAX_TEAM_STATS = 40;
+/**
+ * Cap on team-stat lookups per analysis run.
+ *
+ * A full CFB week is ~75 games, so ~150 teams need a scoring lookup. The cap
+ * was 40, which left only 20 games with BOTH teams' PPG — every other game fell
+ * back to the league average and, under the edge gate, produced nothing at all.
+ */
+const MAX_TEAM_STATS = 160;
 
-export async function GET() {
+/** Max ESPN requests in flight at once — this week needs ~150 lookups. */
+const TEAM_STATS_CONCURRENCY = 8;
+
+/**
+ * Map over items with at most `limit` promises in flight.
+ *
+ * ESPN's edge throttles bursts, and a blanket Promise.all over ~150 lookups
+ * fires them all at once; the failures would be swallowed by the per-team
+ * catch and silently reappear as missing PPG.
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    async () => {
+      for (let i = next++; i < items.length; i = next++) {
+        results[i] = await fn(items[i]);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+export async function GET(request: Request) {
   try {
+    // Reading the request URL keeps this route dynamic (server-rendered on
+    // demand, like the MLB and NFL routes) instead of prerendering it at build
+    // time. A build-time prerender bakes in whichever week was current when the
+    // build ran, and turns a failed upstream fetch into a cached static 500.
+    new URL(request.url);
+
     // 1. Resolve the current week + season from ESPN.
     const ctx = await fetchCfbContext();
 
@@ -25,8 +66,10 @@ export async function GET() {
       ...new Set(gamesWithOdds.flatMap(g => [g.awayTeamId, g.homeTeamId])),
     ].slice(0, MAX_TEAM_STATS);
 
-    const teamStatsResults = await Promise.all(
-      teamIds.map(async id => ({ id, stats: await fetchCfbTeamStats(id, ctx.seasonYear) }))
+    const teamStatsResults = await mapWithConcurrency(
+      teamIds,
+      TEAM_STATS_CONCURRENCY,
+      async id => ({ id, stats: await fetchCfbTeamStats(id, ctx.seasonYear) }),
     );
     const teamStatsMap = new Map(teamStatsResults.map(r => [r.id, r.stats]));
 

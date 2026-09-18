@@ -68,6 +68,25 @@ Pitcher stats are regressed toward league average by sample size (empirical Baye
 - **Top Favorite Picks** — strongest/highest-probability favorites. Ranked by model probability alone.
 - **Best Value** — strongest positive-EV opportunities at the posted prices. Ranked by EV.
 
+### Why the CFB / NFL model sections are empty early in the season
+
+The CFB and NFL models have only two inputs: win rate and points per game. A
+record is not used until a team has played 4 games, so before week 4-5 the
+win-rate term falls back to the league average **on both sides** and the model
+collapses to a single scoring term — and PPG is not opponent-adjusted.
+
+On real slates that produced `UT Martin +4000 · model 46.7% · edge +44.3pp ·
+EV +1815%` (CFB week 3) and `Giants +295 · model 82.7% · edge +58.4pp`
+(NFL week 2). Those are the absence of a model, not opportunities, so every
+model-driven section (Model Edge Picks **and** Top Moneyline Picks) fails closed
+until at least one side clears the 4-game floor. The schedule, spread (ATS) and
+totals sections do not use the model and stay populated throughout.
+
+The durable fix is a model change, not a UI one: give CFB/NFL an
+opponent-adjusted scoring-margin feature and per-feature logit caps like MLB's,
+then re-fit `calibration-cfb.json` / `calibration-nfl.json` with
+`npm run backtest -- --sport cfb|nfl`.
+
 ## Tests
 
 ```bash

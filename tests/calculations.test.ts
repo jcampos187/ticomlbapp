@@ -28,6 +28,10 @@ import {
 } from "@/lib/analysis";
 import { parseInningsPitched } from "@/lib/mlb";
 import type { Game, ModelEdge, PitcherMetrics } from "@/lib/types";
+import { computeCfbModelEdges, analyzeCfbFavorites } from "@/lib/cfbAnalysis";
+import { computeNflModelEdges, analyzeNflFavorites } from "@/lib/nflAnalysis";
+import type { CfbGame } from "@/lib/cfbTypes";
+import type { NflGame } from "@/lib/nflTypes";
 
 /** Baseline synthetic game — a normal, fully-populated matchup. */
 function makeGame(overrides: Partial<Game> = {}): Game {
@@ -802,5 +806,104 @@ describe("backtest mirrors the production model", () => {
     const budget =
       key(production, "MAX_FEATURE_LOGIT", "starterEra") + key(production, "MAX_FEATURE_LOGIT", "k9");
     expect(budget).toBeCloseTo(0.8, 10);
+  });
+});
+
+/**
+ * CFB and NFL model an early-season week with only two inputs — win rate and
+ * points per game. Until a team has MIN_EDGE_GAMES (4) games, the win-rate term
+ * falls back to 0.5, and because PPG is not opponent-adjusted the whole model
+ * collapses to one unbounded scoring term.
+ *
+ * That produced, on real slates: `UT Martin +4000 · model 46.7% · edge +44.3pp ·
+ * EV +1815%` (CFB week 3) and `Giants +295 · model 82.7% · edge +58.4pp`
+ * (NFL week 2). Both are the ABSENCE of a model, not opportunities, so the
+ * model-driven sections must fail closed instead of printing them.
+ *
+ * These tests pin that boundary: a below-floor game with an extreme PPG gap and
+ * a wildly mispriced underdog must produce no edges and no picks.
+ */
+describe("early-season gate (CFB / NFL)", () => {
+  function cfbEarlySeasonGame(overrides: Partial<CfbGame> = {}): CfbGame {
+    return {
+      id: "cfb1",
+      startTime: "2026-09-19T19:00:00Z",
+      status: "scheduled",
+      // 2-0 vs 2-0: both records are BELOW the 4-game floor.
+      awayTeam: "UT Martin",
+      homeTeam: "Georgia",
+      awayAbbrev: "UTM",
+      homeAbbrev: "UGA",
+      awayRecord: "2-0",
+      homeRecord: "2-0",
+      // Market: a massive underdog, correctly priced.
+      awayML: 4000,
+      homeML: -20000,
+      overUnder: 55.5,
+      details: "UGA -38.5",
+      awaySpread: 38.5,
+      homeSpread: -38.5,
+      awayMLOpen: 4000,
+      homeMLOpen: -20000,
+      awaySpreadOpen: 38.5,
+      homeSpreadOpen: -38.5,
+      provider: "DraftKings",
+      // The extreme PPG gap that blows the uncapped model up.
+      awayPpg: 47.0,
+      homePpg: 21.0,
+      awayConference: null,
+      homeConference: null,
+      ...overrides,
+    };
+  }
+
+  function nflEarlySeasonGame(overrides: Partial<NflGame> = {}): NflGame {
+    return {
+      id: "nfl1",
+      startTime: "2026-09-20T17:00:00Z",
+      status: "scheduled",
+      awayTeam: "Giants",
+      homeTeam: "Eagles",
+      awayAbbrev: "NYG",
+      homeAbbrev: "PHI",
+      awayRecord: "1-0",
+      homeRecord: "1-0",
+      awayML: 295,
+      homeML: -370,
+      overUnder: 45.5,
+      details: "PHI -7.5",
+      awaySpread: 7.5,
+      homeSpread: -7.5,
+      awayMLOpen: 295,
+      homeMLOpen: -370,
+      awaySpreadOpen: 7.5,
+      homeSpreadOpen: -7.5,
+      provider: "DraftKings",
+      awayPpg: 30.0,
+      homePpg: 18.0,
+      // The defensive-context and prop-candidate fields are not read by the
+      // edge/pick layers under test, so the cast stands in for them here.
+      ...overrides,
+    } as NflGame;
+  }
+
+  it("emits no CFB edges or moneyline picks before records clear the floor", () => {
+    const games = [cfbEarlySeasonGame()];
+    expect(computeCfbModelEdges(games)).toEqual([]);
+    expect(analyzeCfbFavorites(games)).toEqual([]);
+  });
+
+  it("emits no NFL edges or moneyline picks before records clear the floor", () => {
+    const games = [nflEarlySeasonGame()];
+    expect(computeNflModelEdges(games)).toEqual([]);
+    expect(analyzeNflFavorites(games)).toEqual([]);
+  });
+
+  it("starts producing CFB edges again once both records clear the floor", () => {
+    const games = [
+      cfbEarlySeasonGame({ awayRecord: "4-1", homeRecord: "4-1", awayPpg: 34, homePpg: 24 }),
+    ];
+    // The gate opens, so the layer is free to disagree with the market again.
+    expect(computeCfbModelEdges(games).length + analyzeCfbFavorites(games).length).toBeGreaterThan(0);
   });
 });
