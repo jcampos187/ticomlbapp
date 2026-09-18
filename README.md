@@ -87,6 +87,36 @@ opponent-adjusted scoring-margin feature and per-feature logit caps like MLB's,
 then re-fit `calibration-cfb.json` / `calibration-nfl.json` with
 `npm run backtest -- --sport cfb|nfl`.
 
+A per-feature cap alone does NOT fix it, which is worth knowing before trying:
+the failure is that an unadjusted season average is compared against a sharp
+price for an opponent it never played, so the wrong sign survives any cap.
+
+### Spread, totals and props stay populated
+
+These sections do not use the win-probability model, so they work all season:
+
+- **CFB picks are filtered to today's games, with a labelled week fallback.** A
+  CFB day is often thin (a Friday has a handful of games; the week's best spread
+  picks are on Saturday), so filtering every section to today's teams could
+  render the tab as a schedule and nothing else. Sections now show the week's
+  picks when today's slate has none, with a note saying so.
+- **CFB scoring context covers the whole week.** The team-stat cap was 40, which
+  left only 20 of ~75 games with both teams' points-per-game; it is now 160,
+  fetched 8 at a time.
+- **NFL prop candidates are chosen by production, not roster order.** ESPN's
+  roster is alphabetical, so the previous "first three players by position"
+  picked three *quarterbacks* per team — usually backups with no stats — and
+  never a running back or receiver. Candidates now come from the core API's
+  season leaders (who has actually accumulated yards and touchdowns), with
+  roster order only as a fallback when leaders are unavailable.
+- **NFL props need 2 games, not 4.** At four, no player qualified until week 5;
+  at one, a single game produced lines like `Rushing TDs Over 3.0`. Two is the
+  minimum at which a rate means anything, and thinner samples are flagged on the
+  card.
+- **NFL parlays fall back to spreads.** Every parlay needed two moneyline legs
+  from the edge layer, so the whole Parlays section disappeared early in the
+  season; a 3-ATS combination fills it (mirroring CFB).
+
 ## Tests
 
 ```bash

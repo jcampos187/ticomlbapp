@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { fetchCfbContext, fetchCfbScoreboard, fetchCfbTeamStats } from "@/lib/cfb";
+import { mapWithConcurrency } from "@/lib/concurrency";
 import { analyzeCfbFavorites, analyzeCfbAts, analyzeCfbTotals, buildCfbParlays, computeCfbModelEdges } from "@/lib/cfbAnalysis";
 import type { CfbGame, CfbAnalysisResult } from "@/lib/cfbTypes";
 
+// The slate is resolved from ESPN at request time, so the route must never be
+// prerendered: a build-time render bakes in whichever week was current when the
+// build ran, and caches a failed upstream fetch as a static 500. Response
+// caching is handled explicitly by the Cache-Control header below.
+export const dynamic = "force-dynamic";
 export const revalidate = 300;
 
 /**
@@ -17,40 +23,8 @@ const MAX_TEAM_STATS = 160;
 /** Max ESPN requests in flight at once — this week needs ~150 lookups. */
 const TEAM_STATS_CONCURRENCY = 8;
 
-/**
- * Map over items with at most `limit` promises in flight.
- *
- * ESPN's edge throttles bursts, and a blanket Promise.all over ~150 lookups
- * fires them all at once; the failures would be swallowed by the per-team
- * catch and silently reappear as missing PPG.
- */
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const workers = Array.from(
-    { length: Math.max(1, Math.min(limit, items.length)) },
-    async () => {
-      for (let i = next++; i < items.length; i = next++) {
-        results[i] = await fn(items[i]);
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
-export async function GET(request: Request) {
+export async function GET() {
   try {
-    // Reading the request URL keeps this route dynamic (server-rendered on
-    // demand, like the MLB and NFL routes) instead of prerendering it at build
-    // time. A build-time prerender bakes in whichever week was current when the
-    // build ran, and turns a failed upstream fetch into a cached static 500.
-    new URL(request.url);
-
     // 1. Resolve the current week + season from ESPN.
     const ctx = await fetchCfbContext();
 

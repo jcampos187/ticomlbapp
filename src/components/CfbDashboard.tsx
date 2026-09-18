@@ -557,51 +557,75 @@ export function CfbDashboard() {
           });
         });
         const todayEdges = (data.edges || []).filter(e => todayTeamNames.has(e.team) || todayTeamNames.has(e.opponent));
+
+        // A CFB day is often thin — a Friday has a handful of games while the
+        // week's strongest spread and total picks sit on Saturday — and every
+        // section here was filtered to today's teams, so the whole tab could
+        // render with a schedule and nothing else. Show today's picks when
+        // there are any, and otherwise the week's, labelled so it is obvious
+        // which scope is on screen.
+        const edgesToShow = todayEdges.length > 0 ? todayEdges : (data.edges || []);
+        const picksToShow = todayPicks.length > 0 ? todayPicks : data.topPicks;
+        const atsToShow = todayAts.length > 0 ? todayAts : data.topAts;
+        const totalsToShow = todayTotals.length > 0 ? todayTotals : data.topTotals;
+        const parlaysToShow = todayParlays.length > 0 ? todayParlays : data.parlays;
+        const showingWeek =
+          (todayEdges.length === 0 && (data.edges || []).length > 0) ||
+          (todayPicks.length === 0 && data.topPicks.length > 0) ||
+          (todayAts.length === 0 && data.topAts.length > 0) ||
+          (todayTotals.length === 0 && data.topTotals.length > 0) ||
+          (todayParlays.length === 0 && data.parlays.length > 0);
+
         return (
           <>
-            {todayEdges.length > 0 && (
+            {showingWeek && (
+              <div className="text-xs text-amber-400">
+                ⚠ Today&apos;s slate has no picks of its own — showing this week&apos;s picks instead.
+              </div>
+            )}
+            {edgesToShow.length > 0 && (
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">
                   🎯 Model Edge Picks
                   <span className="text-xs text-muted font-normal">(model prob − de-vigged market · EV = expected value at sportsbook odds)</span>
                 </h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {todayEdges.map((edge, i) => (
+                  {edgesToShow.map((edge, i) => (
                     <ModelEdgeCard key={`${edge.team}-${edge.opponent}`} edge={edge} index={i} />
                   ))}
                 </div>
               </section>
             )}
-            {todayPicks.length > 0 && (
+            {picksToShow.length > 0 && (
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🏆 Top Moneyline Picks <span className="text-xs text-muted font-normal">(ranked by model edge + EV)</span></h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {todayPicks.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
+                  {picksToShow.map((pick, i) => <CfbPickCard key={i} pick={pick} index={i} />)}
                 </div>
               </section>
             )}
-            {todayAts.length > 0 && (
+            {atsToShow.length > 0 && (
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📊 Against the Spread</h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {todayAts.map((pick, i) => <AtsCard key={i} pick={pick} index={i} />)}
+                  {atsToShow.map((pick, i) => <AtsCard key={i} pick={pick} index={i} />)}
                 </div>
               </section>
             )}
-            {todayTotals.length > 0 && (
+            {totalsToShow.length > 0 && (
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">📈 Over/Under Picks</h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {todayTotals.map((total, i) => <TotalCard key={i} total={total} index={i} />)}
+                  {totalsToShow.map((total, i) => <TotalCard key={i} total={total} index={i} />)}
                 </div>
               </section>
             )}
 
-            {todayParlays.length > 0 && (
+            {parlaysToShow.length > 0 && (
               <section>
                 <h2 className="text-xl font-bold mb-4 flex items-center gap-2">🎲 $10 Parlay Combinations</h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {todayParlays.map((parlay, i) => <ParlayCard key={i} parlay={parlay} index={i} />)}
+                  {parlaysToShow.map((parlay, i) => <ParlayCard key={i} parlay={parlay} index={i} />)}
                 </div>
               </section>
             )}

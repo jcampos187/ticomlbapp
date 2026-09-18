@@ -180,6 +180,131 @@ export async function fetchNflRoster(teamId: number): Promise<SkillPlayer[]> {
   }
 }
 
+/** Athlete ids that have actually produced for a team this season, by role. */
+export interface NflTeamLeaders {
+  qbs: number[];
+  rbs: number[];
+  receivers: number[];
+}
+
+/**
+ * Identify which players have ACTUALLY produced for a team this season.
+ *
+ * The roster endpoint lists players alphabetically by name, not by depth
+ * chart — Buffalo's offense group reads Josh Allen, Kyle Allen, then the
+ * practice squad — so "the first quarterback on the roster" is as likely to be
+ * a backup as the starter. Building prop candidates from roster order is what
+ * left the props section completely empty: it fetched season stats for three
+ * quarterbacks per team (usually backups with no stats) and never once looked
+ * at a running back or a receiver.
+ *
+ * This endpoint reports who has accumulated yards and touchdowns, so
+ * candidates can be chosen by production instead of by surname. Returns empty
+ * lists (never throws) when ESPN has nothing — callers fall back to roster
+ * order so a failure degrades rather than emptying the section.
+ */
+export async function fetchNflTeamLeaders(
+  teamId: number,
+  year: number,
+  seasonType: number,
+): Promise<NflTeamLeaders> {
+  try {
+    const url = `${CORE_BASE}/seasons/${year}/types/${seasonType}/teams/${teamId}/leaders`;
+    const data = await fetchJson(url);
+    const categories = data?.categories || [];
+
+    const idsFor = (categoryName: string): number[] => {
+      const cat = categories.find((c: any) => c.name === categoryName);
+      return (cat?.leaders || [])
+        .map((l: any) => Number(/\/athletes\/(\d+)/.exec(l?.athlete?.$ref || "")?.[1]))
+        .filter((n: number) => Number.isFinite(n) && n > 0);
+    };
+
+    const uniq = (ids: number[]) => [...new Set(ids)];
+
+    return {
+      // Passing production identifies the QB who is actually playing.
+      qbs: uniq([...idsFor("passingYards"), ...idsFor("passingTouchdowns")]),
+      rbs: uniq([...idsFor("rushingYards"), ...idsFor("rushingTouchdowns")]),
+      // Receiving production covers WR and TE alike.
+      receivers: uniq([
+        ...idsFor("receivingYards"),
+        ...idsFor("receivingTouchdowns"),
+        ...idsFor("receptions"),
+      ]),
+    };
+  } catch {
+    return { qbs: [], rbs: [], receivers: [] };
+  }
+}
+
+/** How many players to consider per role when choosing prop candidates. */
+export interface PropCandidateLimits {
+  qbs: number;
+  rbs: number;
+  receivers: number;
+}
+
+/**
+ * Choose which players get season-stat lookups, and therefore which can become
+ * prop picks.
+ *
+ * Candidates come from the athletes the leaders endpoint says are producing,
+ * by role. Roster order is deliberately NOT the primary source: it is
+ * alphabetical, so taking the first players from it picked three quarterbacks
+ * per team and never a running back or receiver, and most of those
+ * quarterbacks were backups with no stats — which is why the props section was
+ * empty. Roster order is only the fallback, so a missing leaders response
+ * degrades coverage instead of emptying the section.
+ */
+export function selectPropCandidates(
+  roster: SkillPlayer[],
+  leaders: NflTeamLeaders | null,
+  limits: PropCandidateLimits,
+): SkillPlayer[] {
+  const byId = new Map(roster.map(p => [p.id, p]));
+  const chosen: SkillPlayer[] = [];
+  const taken = new Set<number>();
+
+  const take = (ids: number[] | undefined, positions: string[], limit: number) => {
+    const fromLeaders = (ids ?? [])
+      .map(id => byId.get(id))
+      .filter((p): p is SkillPlayer =>
+        !!p && !taken.has(p.id) && positions.includes(p.position),
+      )
+      .slice(0, limit);
+
+    if (fromLeaders.length > 0) {
+      for (const p of fromLeaders) {
+        taken.add(p.id);
+        chosen.push(p);
+      }
+      return;
+    }
+
+    // No usable leader ids for this role — the leaders call failed, or the team
+    // has no production recorded there yet. Roster order is worse than
+    // production but better than nothing, and it is never used to *supplement*
+    // a role that leaders already answered (that would re-introduce the
+    // alphabetical-backup picks this function exists to avoid).
+    let n = 0;
+    for (const p of roster) {
+      if (n >= limit) break;
+      if (taken.has(p.id) || !positions.includes(p.position)) continue;
+      taken.add(p.id);
+      chosen.push(p);
+      n++;
+    }
+  };
+
+  take(leaders?.qbs, ["QB"], limits.qbs);
+  take(leaders?.rbs, ["RB"], limits.rbs);
+  // Receiving production covers WR and TE alike.
+  take(leaders?.receivers, ["WR", "TE"], limits.receivers);
+
+  return chosen;
+}
+
 export interface PlayerSeasonStats {
   gamesPlayed: number;
   passingYardsPerGame: number | null;

@@ -10,6 +10,10 @@ import {
 } from "@/lib/analysis";
 import type { AnalysisResult } from "@/lib/types";
 
+// The slate is resolved from ESPN/MLB at request time (and `?date=` selects the
+// day), so the route must never be prerendered. Response caching is handled
+// explicitly by the Cache-Control header below.
+export const dynamic = "force-dynamic";
 export const revalidate = 300;
 
 /** Server-local YYYY-MM-DD (MLB games are scheduled on US dates, so UTC could be off by a day in the evening). */

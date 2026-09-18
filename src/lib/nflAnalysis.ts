@@ -413,8 +413,24 @@ interface PropProjection {
   reasons: string[];
 }
 
-/** Minimum games played for a player to qualify for a projected prop (filters out backups/one-game wonders). */
-const MIN_GAMES = 4;
+/**
+ * Minimum games played for a player to qualify for a projected prop.
+ *
+ * This is a floor against one-game wonders and backups, not a season-length
+ * gate: at 4 it suppressed EVERY prop for the first month of the season (no
+ * player has four games until week 5).
+ *
+ * Do not drop it to 1. At one game the "per-game average" is a single
+ * performance and the opponent's allowance is a single game, which produced
+ * `D'Andre Swift Rushing TDs Over 3.0` and `Chris Olave Receiving Yards Over
+ * 129` (avg 182) off one week. Two games is the minimum at which a rate means
+ * anything, and the projection still reports the games played and flags a thin
+ * sample (see THIN_SAMPLE_GAMES below).
+ */
+const MIN_GAMES = 2;
+
+/** At or below this many games the projection is flagged as a thin sample. */
+const THIN_SAMPLE_GAMES = 4;
 
 interface OppDef {
   passYds: number | null;
@@ -548,6 +564,11 @@ function evaluateCandidate(
   const reasons: string[] = [
     `${player.statsSeason} season: ${candidate.playerAvg.toFixed(1)}/game (${player.gamesPlayed} GP)`,
   ];
+  if (player.gamesPlayed < THIN_SAMPLE_GAMES) {
+    reasons.push(
+      `⚠ Thin sample — only ${player.gamesPlayed} game${player.gamesPlayed === 1 ? "" : "s"} played`,
+    );
+  }
 
   // Matchup-aware: blend the player's average with what the opponent defense
   // actually concedes per game when we have it. For yards/receptions markets
@@ -764,6 +785,21 @@ export function buildNflParlays(
     parlays.push({
       name: "Grand Slam (3 ML + 1 ATS + 1 O/U)",
       legs: [...mlLabels.slice(0, 3), atsLabels[0], totalLabel],
+      ...p,
+    });
+  }
+
+  // Parlay 5: 3 ATS. Every parlay above needs at least two moneyline legs, and
+  // those come from the model-edge layer — which is empty until records clear
+  // its data floor. Without this fallback the whole Parlays section vanished
+  // for the first weeks of the season even though spreads were available. Uses
+  // its own slice because atsOdds/atsLabels are capped at 2 above.
+  if (mlEdges.length < 2 && topAts.length >= 3) {
+    const ats3 = topAts.slice(0, 3);
+    const p = calculateParlayPayout(ats3.map(() => -110));
+    parlays.push({
+      name: "Spread Hat Trick (3 ATS)",
+      legs: ats3.map(a => `${a.line} (-110)`),
       ...p,
     });
   }

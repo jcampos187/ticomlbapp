@@ -4,27 +4,37 @@ import {
   fetchNflScoreboard,
   fetchNflGameOdds,
   fetchNflRoster,
+  fetchNflTeamLeaders,
   fetchNflPlayerStats,
   fetchNflTeamStats,
+  selectPropCandidates,
   nflWeekLabel,
 } from "@/lib/nfl";
+import { mapWithConcurrency } from "@/lib/concurrency";
 import { analyzeNflFavorites, analyzeNflAts, analyzeNflTotals, analyzeNflProps, buildNflParlays, computeNflModelEdges } from "@/lib/nflAnalysis";
 import type { NflGame, NflPropCandidate, NflAnalysisResult } from "@/lib/nflTypes";
 
+// The slate is resolved from ESPN at request time, so the route must never be
+// prerendered. Response caching is handled explicitly by the Cache-Control
+// header below.
+export const dynamic = "force-dynamic";
 export const revalidate = 300;
 
-/** Cap on player-stat lookups per analysis run (mirrors MLB's 16-pitcher cap). */
-const MAX_PLAYER_STATS = 72;
-/** Skill players to consider per team (QB first, then RB, then WR/TE). */
-const PLAYERS_PER_TEAM = 3;
+const ESPN_CONCURRENCY = 8;
 
-export async function GET(request: Request) {
+/**
+ * Cap on player-stat lookups per analysis run.
+ *
+ * With one QB, one RB and two receivers per team, a full 32-team week needs
+ * 128. The cap was 72, which truncated the week before it was covered.
+ */
+const MAX_PLAYER_STATS = 128;
+
+/** Role quotas for prop candidates — see selectPropCandidates. */
+const PROP_CANDIDATE_LIMITS = { qbs: 1, rbs: 1, receivers: 2 };
+
+export async function GET() {
   try {
-    // Reading the request URL keeps this route dynamic (server-rendered on
-    // demand like the MLB route) rather than statically prerendered at build
-    // time, so the weekly slate is always fresh on first load.
-    new URL(request.url);
-
     // 1. Resolve the current week + season from ESPN.
     const ctx = await fetchNflContext();
 
@@ -48,21 +58,36 @@ export async function GET(request: Request) {
       ),
     ];
 
-    // 5. Fetch rosters (skill players) for each team, in parallel.
-    const rosterResults = await Promise.all(
-      teamIds.map(async id => ({ id, players: await fetchNflRoster(id) }))
-    );
-    const rosterMap = new Map(rosterResults.map(r => [r.id, r.players]));
+    // Season whose stats feed the projections. During preseason the current
+    // season has no games yet, so use the prior regular season.
+    const statsSeason =
+      ctx.seasonType === 1 ? ctx.seasonYear - 1 : ctx.seasonYear;
 
-    // 6. Pick a capped set of players to fetch stats for (QB > RB > WR/TE,
-    //    max PLAYERS_PER_TEAM per team, global cap MAX_PLAYER_STATS).
-    const rank = (pos: string) => (pos === "QB" ? 0 : pos === "RB" ? 1 : pos === "WR" ? 2 : 3);
+    // 5. Rosters (names + positions) and season leaders (who is actually
+    //    producing) for every team in the week.
+    const [rosterResults, leaderResults] = await Promise.all([
+      mapWithConcurrency(teamIds, ESPN_CONCURRENCY, async id => ({
+        id,
+        players: await fetchNflRoster(id),
+      })),
+      mapWithConcurrency(teamIds, ESPN_CONCURRENCY, async id => ({
+        id,
+        leaders: await fetchNflTeamLeaders(id, statsSeason, 2),
+      })),
+    ]);
+    const rosterMap = new Map(rosterResults.map(r => [r.id, r.players]));
+    const leaderMap = new Map(leaderResults.map(r => [r.id, r.leaders]));
+
+    // 6. Pick candidates by PRODUCTION (see selectPropCandidates — roster
+    //    order is alphabetical and picked backups), under a global cap.
     const statTargets: { teamId: number; player: NflPropCandidate }[] = [];
 
     for (const id of teamIds) {
-      const players = (rosterMap.get(id) || [])
-        .sort((a, b) => rank(a.position) - rank(b.position))
-        .slice(0, PLAYERS_PER_TEAM);
+      const players = selectPropCandidates(
+        rosterMap.get(id) || [],
+        leaderMap.get(id) ?? null,
+        PROP_CANDIDATE_LIMITS,
+      );
       for (const p of players) {
         statTargets.push({
           teamId: id,
@@ -72,22 +97,22 @@ export async function GET(request: Request) {
       if (statTargets.length >= MAX_PLAYER_STATS) break;
     }
 
-    // 7. Fetch season stats. During preseason use the prior regular season;
-    //    during regular/postseason use the current season.
-    const statsSeason =
-      ctx.seasonType === 1 ? ctx.seasonYear - 1 : ctx.seasonYear;
-
-    const statsResults = await Promise.all(
-      statTargets.map(async ({ teamId, player }) => ({
+    // 7. Season stats for the selected candidates only.
+    const statsResults = await mapWithConcurrency(
+      statTargets,
+      ESPN_CONCURRENCY,
+      async ({ teamId, player }) => ({
         teamId,
         player,
         stats: await fetchNflPlayerStats(player.playerId, statsSeason, 2),
-      }))
+      }),
     );
 
     // 8. Fetch team season stats for scoring context (points per game).
-    const teamStatsResults = await Promise.all(
-      teamIds.map(async id => ({ id, stats: await fetchNflTeamStats(id, statsSeason, 2) }))
+    const teamStatsResults = await mapWithConcurrency(
+      teamIds,
+      ESPN_CONCURRENCY,
+      async id => ({ id, stats: await fetchNflTeamStats(id, statsSeason, 2) }),
     );
     const teamStatsMap = new Map(teamStatsResults.map(r => [r.id, r.stats]));
 

@@ -29,9 +29,11 @@ import {
 import { parseInningsPitched } from "@/lib/mlb";
 import type { Game, ModelEdge, PitcherMetrics } from "@/lib/types";
 import { computeCfbModelEdges, analyzeCfbFavorites } from "@/lib/cfbAnalysis";
-import { computeNflModelEdges, analyzeNflFavorites } from "@/lib/nflAnalysis";
+import { computeNflModelEdges, analyzeNflFavorites, analyzeNflProps, buildNflParlays } from "@/lib/nflAnalysis";
+import { selectPropCandidates } from "@/lib/nfl";
+import type { SkillPlayer } from "@/lib/nfl";
 import type { CfbGame } from "@/lib/cfbTypes";
-import type { NflGame } from "@/lib/nflTypes";
+import type { NflGame, NflPropCandidate, NflAtsPick, NflTotalPick } from "@/lib/nflTypes";
 
 /** Baseline synthetic game — a normal, fully-populated matchup. */
 function makeGame(overrides: Partial<Game> = {}): Game {
@@ -905,5 +907,168 @@ describe("early-season gate (CFB / NFL)", () => {
     ];
     // The gate opens, so the layer is free to disagree with the market again.
     expect(computeCfbModelEdges(games).length + analyzeCfbFavorites(games).length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * NFL prop candidates were chosen by slicing the roster, which is ordered
+ * alphabetically rather than by depth chart. Every team contributed three
+ * QUARTERBACKS (Buffalo's roster reads Josh Allen, Kyle Allen, then the
+ * practice squad), so the fetched stats were mostly backups with no games
+ * played and the props section never showed a running back or receiver prop.
+ */
+describe("NFL prop candidate selection", () => {
+  const QB = (id: number, name: string): SkillPlayer => ({ id, name, position: "QB" });
+  const RB = (id: number, name: string): SkillPlayer => ({ id, name, position: "RB" });
+  const WR = (id: number, name: string): SkillPlayer => ({ id, name, position: "WR" });
+  const TE = (id: number, name: string): SkillPlayer => ({ id, name, position: "TE" });
+
+  const LIMITS = { qbs: 1, rbs: 1, receivers: 2 };
+
+  // Alphabetical, exactly like ESPN's offense group.
+  const roster = [
+    QB(1, "Josh Allen"),
+    QB(2, "Kyle Allen"),
+    WR(3, "Skyler Bell"),
+    RB(4, "James Cook III"),
+    RB(5, "Frank Gore Jr."),
+    TE(6, "Dalton Kincaid"),
+    WR(7, "Khalil Shakir"),
+  ];
+
+  it("picks the producing QB from leaders, not the first name on the roster", () => {
+    // Kyle Allen (id 2) has the passing production in this fixture; the
+    // alphabetically-first QB is Josh Allen (id 1).
+    const chosen = selectPropCandidates(
+      roster,
+      { qbs: [2], rbs: [4], receivers: [7, 6] },
+      LIMITS,
+    );
+    const qb = chosen.filter(p => p.position === "QB");
+    expect(qb.map(p => p.id)).toEqual([2]);
+    expect(chosen.map(p => p.id)).toEqual([2, 4, 7, 6]);
+  });
+
+  it("does not top a role up from roster order when leaders answered it", () => {
+    // One receiver identified → exactly one receiver chosen, even though the
+    // quota is two. Supplementing from roster order is how alphabetical
+    // backups got in originally.
+    const chosen = selectPropCandidates(
+      roster,
+      { qbs: [2], rbs: [5], receivers: [6] },
+      LIMITS,
+    );
+    expect(chosen.map(p => p.id)).toEqual([2, 5, 6]);
+  });
+
+  it("covers running backs and receivers, not just quarterbacks", () => {
+    const chosen = selectPropCandidates(
+      roster,
+      { qbs: [1], rbs: [4], receivers: [6, 7] },
+      LIMITS,
+    );
+    expect(chosen.map(p => p.position).sort()).toEqual(["QB", "RB", "TE", "WR"]);
+  });
+
+  it("never returns more than the role quotas", () => {
+    const chosen = selectPropCandidates(
+      roster,
+      { qbs: [1, 2], rbs: [4, 5], receivers: [3, 6, 7] },
+      LIMITS,
+    );
+    const byPos = chosen.reduce<Record<string, number>>((m, p) => {
+      m[p.position] = (m[p.position] || 0) + 1;
+      return m;
+    }, {});
+    expect(byPos.QB).toBe(1);
+    expect(byPos.RB).toBe(1);
+    expect((byPos.WR || 0) + (byPos.TE || 0)).toBe(2);
+  });
+
+  it("falls back to roster order when a team has no leaders", () => {
+    const chosen = selectPropCandidates(roster, null, LIMITS);
+    expect(chosen.length).toBe(4);
+    expect(chosen.filter(p => p.position === "RB").length).toBe(1);
+  });
+});
+
+describe("NFL props and the ATS-only parlay", () => {
+  function cand(overrides: Partial<NflPropCandidate>): NflPropCandidate {
+    return {
+      playerId: 1,
+      name: "Player",
+      position: "WR",
+      teamAbbrev: "AAA",
+      statsSeason: 2026,
+      gamesPlayed: 4,
+      passingYardsPerGame: null,
+      passingTdsPerGame: null,
+      rushingYardsPerGame: null,
+      rushingTdsPerGame: null,
+      receivingYardsPerGame: null,
+      receivingTdsPerGame: null,
+      receptionsPerGame: null,
+      ...overrides,
+    };
+  }
+
+  function game(props: NflPropCandidate[]): NflGame {
+    return {
+      id: "g",
+      startTime: "2026-09-20T17:00:00Z",
+      status: "scheduled",
+      awayTeam: "Away",
+      homeTeam: "Home",
+      awayAbbrev: "AAA",
+      homeAbbrev: "HHH",
+      awayRecord: "4-1",
+      homeRecord: "4-1",
+      awayML: -120,
+      homeML: 100,
+      overUnder: 45.5,
+      details: "AAA -1.5",
+      awaySpread: -1.5,
+      homeSpread: 1.5,
+      awayMLOpen: -120,
+      homeMLOpen: 100,
+      awaySpreadOpen: -1.5,
+      homeSpreadOpen: 1.5,
+      provider: "DraftKings",
+      awayPpg: 25,
+      homePpg: 23,
+      awayProps: props,
+      homeProps: [],
+      // Defensive-context fields aren't read by the props layer under test.
+    } as unknown as NflGame;
+  }
+
+  it("projects rushing and receiving markets, not only quarterback ones", () => {
+    const props = analyzeNflProps([
+      game([
+        cand({ name: "Bell Cow", position: "RB", rushingYardsPerGame: 95, rushingTdsPerGame: 0.8 }),
+        cand({ name: "WR One", position: "WR", receivingYardsPerGame: 88, receptionsPerGame: 6.5 }),
+      ]),
+    ]);
+    expect(props.length).toBeGreaterThan(0);
+    expect(props.map(p => p.position).some(pos => pos === "RB" || pos === "WR")).toBe(true);
+  });
+
+  it("still excludes players without a second game of data", () => {
+    const props = analyzeNflProps([
+      game([cand({ name: "One Game", position: "RB", gamesPlayed: 1, rushingYardsPerGame: 140 })]),
+    ]);
+    expect(props).toEqual([]);
+  });
+
+  it("builds an ATS-only parlay when no moneyline edges exist", () => {
+    const ats: NflAtsPick[] = [
+      { team: "Ravens", opponent: "Browns", line: "Ravens -8.5", spread: -8.5, reasons: [] },
+      { team: "49ers", opponent: "Rams", line: "49ers -12.5", spread: -12.5, reasons: [] },
+      { team: "Bears", opponent: "Lions", line: "Bears -4.5", spread: -4.5, reasons: [] },
+    ];
+    const parlays = buildNflParlays([], ats, [] as NflTotalPick[]);
+    expect(parlays.length).toBe(1);
+    expect(parlays[0].legs.length).toBe(3);
+    expect(parlays[0].name).toContain("ATS");
   });
 });
