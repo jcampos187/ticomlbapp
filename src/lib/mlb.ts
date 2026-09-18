@@ -1,4 +1,5 @@
 import { TEAM_MAP } from "./espn";
+import type { PitcherMetrics } from "./types";
 
 const MLB_API = "https://statsapi.mlb.com/api/v1";
 const USER_AGENT = "Mozilla/5.0 (compatible; MLBBot/1.0)";
@@ -190,40 +191,95 @@ export function matchGameToMlbSchedule(
   return null;
 }
 
-export async function fetchPitcherStats(playerId: number): Promise<{
-  k9: number | null;
-  era: number | null;
-  whip: number | null;
-  avgK: number | null;
-  over6_5Rate: number | null;
-  starts: number;
-  /** Season innings pitched — the sample-size basis for stat regression. */
-  ip: number | null;
-  gameLogs: number[];
-}> {
-  const result = {
-    k9: null as number | null,
-    era: null as number | null,
-    whip: null as number | null,
-    avgK: null as number | null,
-    over6_5Rate: null as number | null,
+/** Parse a numeric API field, returning null instead of NaN/0-for-missing. */
+function numOrNull(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Parse MLB's `inningsPitched`, which uses baseball notation where the
+ * fractional digit is thirds: "123.1" = 123 1/3 innings, "123.2" = 123 2/3.
+ *
+ * `parseFloat("123.1")` would silently return 123.1, understating IP by up to
+ * 0.2 innings. That matters here because IP is the sample-size weight for the
+ * empirical-Bayes ERA/K9 shrinkage and the denominator of FIP.
+ */
+export function parseInningsPitched(raw: string | number | null | undefined): number | null {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = /^(\d+)(?:\.([0-2]))?$/.exec(s);
+  if (!m) return null;
+  const whole = Number(m[1]);
+  const third = m[2] ? Number(m[2]) : 0;
+  return whole + third / 3;
+}
+
+/** Conventional FIP offset (league-average ERA constant in the standard formula). */
+const FIP_CONSTANT = 3.1;
+
+/** Per-nine rate from a counting stat, or null when it can't be computed. */
+function per9(count: number | null, ip: number | null): number | null {
+  if (count == null || ip == null || ip <= 0) return null;
+  return (count / ip) * 9;
+}
+
+/**
+ * Fetch a starter's season metrics (plus game log) from the MLB Stats API.
+ *
+ * Everything returned is either a real published value, computed from real
+ * counting stats, or null. Nothing is estimated: when a pitcher has no game
+ * log there is no per-start strikeout average, and we report null rather
+ * than inventing one.
+ */
+export async function fetchPitcherStats(
+  playerId: number,
+): Promise<PitcherMetrics & { gameLogs: number[] }> {
+  const result: PitcherMetrics & { gameLogs: number[] } = {
+    era: null,
+    k9: null,
+    bb9: null,
+    hr9: null,
+    whip: null,
+    fip: null,
+    ip: null,
     starts: 0,
-    ip: null as number | null,
-    gameLogs: [] as number[],
+    avgK: null,
+    over6_5Rate: null,
+    source: "MLB Stats API (season splits + game log)",
+    season: null,
+    gameLogs: [],
   };
 
   for (const season of [2026, 2025]) {
     const url = `${MLB_API}/people/${playerId}/stats?stats=season&group=pitching&season=${season}&gameType=R`;
     const data = await fetchJson(url);
-    if (data?.stats?.[0]?.splits?.[0]) {
-      const s = data.stats[0].splits[0].stat;
-      result.k9 = parseFloat(s.strikeoutsPer9Inn) || null;
-      result.era = parseFloat(s.era) || null;
-      result.whip = parseFloat(s.whip) || null;
-      result.starts = parseInt(s.gamesStarted) || 0;
-      result.ip = parseFloat(s.inningsPitched) || null;
-      break;
-    }
+    const s = data?.stats?.[0]?.splits?.[0]?.stat;
+    if (!s) continue;
+
+    const ip = parseInningsPitched(s.inningsPitched);
+    const hr = numOrNull(s.homeRuns);
+    const bb = numOrNull(s.baseOnBalls);
+    const hbp = numOrNull(s.hitByPitch);
+    const so = numOrNull(s.strikeOuts);
+
+    result.season = season;
+    result.k9 = numOrNull(s.strikeoutsPer9Inn);
+    result.era = numOrNull(s.era);
+    result.whip = numOrNull(s.whip);
+    result.starts = parseInt(s.gamesStarted) || 0;
+    result.ip = ip;
+    result.bb9 = numOrNull(s.walksPer9Inn) ?? per9(bb, ip);
+    result.hr9 = numOrNull(s.homeRunsPer9) ?? per9(hr, ip);
+
+    // FIP from real counting stats only: (13*HR + 3*(BB+HBP) - 2*SO)/IP + C
+    result.fip =
+      ip != null && ip > 0 && hr != null && bb != null && so != null
+        ? (13 * hr + 3 * (bb + (hbp ?? 0)) - 2 * so) / ip + FIP_CONSTANT
+        : null;
+    break;
   }
 
   for (const season of [2026, 2025]) {
@@ -246,9 +302,10 @@ export async function fetchPitcherStats(playerId: number): Promise<{
     }
   }
 
-  if (result.avgK === null && result.k9 !== null) {
-    result.avgK = (result.k9 / 9) * 5.2;
-  }
+  // NOTE: there used to be a fabricated fallback here — avgK = (k9/9)*5.2 —
+  // for pitchers with no game log. That presented an invented per-start
+  // average as if it were measured, so it has been removed. No game log
+  // means avgK stays null and the UI shows nothing for K/Start.
 
   return result;
 }

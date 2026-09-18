@@ -71,6 +71,17 @@ function mlbRows(d, sport, dateFallback) {
       sport,
       category: "Moneyline",
       pick: `${p.team} ML (${fmtOdds(p.ml)}) vs ${p.opponent}`,
+      // Persist the numbers the model produced so picks captured from now on
+      // can be bucketed by edge/EV and validated against outcomes later.
+      // Rows written before this change simply lack these fields.
+      ml: p.ml,
+      modelProb: p.modelProb,
+      rawMarketProb: p.rawMarketProb,
+      fairMarketProb: p.fairMarketProb,
+      edge: p.edge,
+      ev: p.ev,
+      confidence: p.confidence,
+      dataQuality: p.dataQuality,
     });
   }
   for (const p of d.topKProps || []) {

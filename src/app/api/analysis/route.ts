@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
-import { fetchScoreboard, fetchGameOdds, TEAM_MAP } from "@/lib/espn";
-import { fetchTodaysPitchers, matchGameToMlbSchedule, fetchPitcherStats, fetchTeamTrends } from "@/lib/mlb";
-import { analyzeFavorites, analyzeKProps, analyzeTotals, buildParlays, computeModelEdges } from "@/lib/analysis";
-import type { Game, AnalysisResult } from "@/lib/types";
+import { buildMlbGames } from "@/lib/buildGames";
+import {
+  analyzeFavorites,
+  analyzeBestValue,
+  analyzeKProps,
+  analyzeTotals,
+  buildParlays,
+  computeModelEdges,
+} from "@/lib/analysis";
+import type { AnalysisResult } from "@/lib/types";
 
 export const revalidate = 300;
 
@@ -39,159 +45,27 @@ export async function GET(request: Request) {
     const requested = new URL(request.url).searchParams.get("date");
     const today = requested && isValidDate(requested) ? requested : localDate();
 
-    // 1. Fetch scoreboard (games + basic info) + MLB schedule (pitchers)
-    const [espnGames, mlbScheduleGames] = await Promise.all([
-      fetchScoreboard(today),
-      fetchTodaysPitchers(today),
-    ]);
+    // Fetch + assemble games (odds, probable pitchers, pitcher metrics,
+    // team trends). Only games with a market are returned.
+    const games = await buildMlbGames(today);
 
-    // 2. Fetch odds for each game
-    const oddsPromises = espnGames.map(g => fetchGameOdds(g.id));
-    const allOdds = await Promise.all(oddsPromises);
-
-    // 3. Match ESPN games to MLB schedule games and build game objects.
-    //    Use a Set to track which MLB gamePk's have been matched so each
-    //    doubleheader game gets its own probable pitchers.
-    const games: Game[] = [];
-    const pitcherIds: number[] = [];
-    const usedPks = new Set<number>();
-
-    for (let i = 0; i < espnGames.length; i++) {
-      const eg = espnGames[i];
-      const odds = allOdds[i];
-
-      // Match this ESPN game to the corresponding MLB schedule game
-      const mlbGame = matchGameToMlbSchedule(
-        eg.awayAbbrev, eg.homeAbbrev, eg.startTime, mlbScheduleGames, usedPks,
-      );
-
-      const awayPitcher = mlbGame?.away ?? null;
-      const homePitcher = mlbGame?.home ?? null;
-
-      const awayPitcherName = awayPitcher?.name ?? "";
-      const homePitcherName = homePitcher?.name ?? "";
-
-      if (awayPitcher?.id) pitcherIds.push(awayPitcher.id);
-      if (homePitcher?.id) pitcherIds.push(homePitcher.id);
-
-      // Determine if both pitchers are confirmed (not TBD)
-      const pitcherConfirmed =
-        !!awayPitcherName && awayPitcherName !== "TBD" &&
-        !!homePitcherName && homePitcherName !== "TBD";
-
-      games.push({
-        id: eg.id,
-        startTime: eg.startTime,
-        status: eg.status,
-        awayTeam: TEAM_MAP[eg.awayAbbrev] || eg.awayName,
-        homeTeam: TEAM_MAP[eg.homeAbbrev] || eg.homeName,
-        awayAbbrev: eg.awayAbbrev,
-        homeAbbrev: eg.homeAbbrev,
-        awayRecord: eg.awayRecord,
-        homeRecord: eg.homeRecord,
-        awayML: odds?.awayML ?? 0,
-        homeML: odds?.homeML ?? 0,
-        overUnder: odds?.overUnder ?? 0,
-        awayPitcher: awayPitcherName,
-        homePitcher: homePitcherName,
-        awayPitcherRecord: "",
-        homePitcherRecord: "",
-        awayK9: null,
-        homeK9: null,
-        awayAvgK: null,
-        homeAvgK: null,
-        awayOver6_5: null,
-        homeOver6_5: null,
-        awayEra: null,
-        homeEra: null,
-        awayIp: null,
-        homeIp: null,
-        awayRunsPerGame: null,
-        homeRunsPerGame: null,
-        awayBullpenEra: null,
-        homeBullpenEra: null,
-        awayMLOpen: odds?.awayMLOpen ?? null,
-        homeMLOpen: odds?.homeMLOpen ?? null,
-        pitcherConfirmed,
-      });
-    }
-
-    // 4. Fetch pitcher stats (limit to top 8 games = 16 pitchers)
-    const uniqueIds = [...new Set(pitcherIds)].slice(0, 16);
-    const statResults = await Promise.all(
-      uniqueIds.map(id => fetchPitcherStats(id).then(stats => ({ id, stats })))
-    );
-    const statMap = new Map(statResults.map(r => [r.id, r.stats]));
-
-    // Map stats back to games using the matched MLB schedule data
-    // Re-iterate to attach stats (we need to re-match since we consumed usedPks)
-    const usedPksForStats = new Set<number>();
-    for (let i = 0; i < espnGames.length; i++) {
-      const eg = espnGames[i];
-      const game = games[i];
-      const mlbGame = matchGameToMlbSchedule(
-        eg.awayAbbrev, eg.homeAbbrev, eg.startTime, mlbScheduleGames, usedPksForStats,
-      );
-
-      const awayPitcherId = mlbGame?.away?.id;
-      const homePitcherId = mlbGame?.home?.id;
-
-      const awayStats = awayPitcherId ? statMap.get(awayPitcherId) : undefined;
-      const homeStats = homePitcherId ? statMap.get(homePitcherId) : undefined;
-
-      if (awayStats) {
-        game.awayK9 = awayStats.k9;
-        game.awayAvgK = awayStats.avgK;
-        game.awayOver6_5 = awayStats.over6_5Rate;
-        game.awayEra = awayStats.era;
-        game.awayIp = awayStats.ip;
-      }
-      if (homeStats) {
-        game.homeK9 = homeStats.k9;
-        game.homeAvgK = homeStats.avgK;
-        game.homeOver6_5 = homeStats.over6_5Rate;
-        game.homeEra = homeStats.era;
-        game.homeIp = homeStats.ip;
-      }
-    }
-
-    // 5. Only analyze games with odds data; fetch team scoring trends
-    //    (runs/game + bullpen ERA) for every team so the totals analysis
-    //    has offensive/relief context.
-    const gamesWithOdds = games.filter(g => g.awayML !== 0 || g.homeML !== 0);
-    const teamNames = [...new Set(gamesWithOdds.flatMap(g => [g.awayTeam, g.homeTeam]))];
-    const trendResults = await Promise.all(
-      teamNames.map(name => fetchTeamTrends(name).then(trends => ({ name, trends })))
-    );
-    const teamTrendMap = new Map(trendResults.map(r => [r.name, r.trends]));
-
-    for (const game of gamesWithOdds) {
-      const awayTrends = teamTrendMap.get(game.awayTeam);
-      const homeTrends = teamTrendMap.get(game.homeTeam);
-      if (awayTrends) {
-        game.awayRunsPerGame = awayTrends.runsPerGame;
-        game.awayBullpenEra = awayTrends.bullpenEra;
-      }
-      if (homeTrends) {
-        game.homeRunsPerGame = homeTrends.runsPerGame;
-        game.homeBullpenEra = homeTrends.bullpenEra;
-      }
-    }
-
-    // 6. Run analysis (only games with odds data)
-    //    Edges are computed first — they use the normalised model probabilities
-    //    and de-vigged market probabilities internally.
-    const edges = computeModelEdges(gamesWithOdds);
-    const topPicks = analyzeFavorites(gamesWithOdds);
-    const topKProps = analyzeKProps(gamesWithOdds);
-    const topTotals = analyzeTotals(gamesWithOdds);
+    // Three deliberately separate concepts:
+    //   edges     = model/market value (edge + EV + confidence + data quality)
+    //   topPicks  = strongest/highest-probability favorites
+    //   bestValue = strongest positive-EV opportunities at the posted prices
+    const edges = computeModelEdges(games);
+    const topPicks = analyzeFavorites(games);
+    const bestValue = analyzeBestValue(games);
+    const topKProps = analyzeKProps(games);
+    const topTotals = analyzeTotals(games);
     const parlays = buildParlays(edges, topKProps, topTotals);
 
     const result: AnalysisResult = {
       date: today,
-      games: gamesWithOdds,
+      games,
       edges,
       topPicks,
+      bestValue,
       topKProps,
       topTotals,
       parlays,

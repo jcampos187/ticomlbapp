@@ -40,7 +40,10 @@ const LEAGUE_AVG = {
   winRate: 0.5,
   runsPerGame: 4.5,
   starterEra: 4.25,
+  fip: 4.1,
   k9: 8.6,
+  bb9: 3.2,
+  hr9: 1.25,
   bullpenEra: 4.1,
 };
 
@@ -51,20 +54,66 @@ const HOME_ADV = 0.24;
 const COEF_WIN_RATE = 2.8;
 const COEF_RUNS_PER_GAME = 0.22;
 const COEF_STARTER_ERA = 0.28;
+const COEF_FIP = 0.22;
 const COEF_K9 = 0.05;
+const COEF_BB9 = 0.06;
+const COEF_HR9 = 0.18;
 const COEF_BULLPEN_ERA = 0.18;
 const MAX_FEATURE_LOGIT = {
   winRate: 0.6,
   runsPerGame: 0.4,
   starterEra: 0.5,
+  fip: 0.4,
   k9: 0.3,
+  bb9: 0.15,
+  hr9: 0.15,
   bullpenEra: 0.4,
 };
+
+/**
+ * Shared logit budget for the whole starting-pitcher package — MUST match
+ * MAX_STARTER_BUNDLE_LOGIT in src/lib/analysis.ts. ERA, FIP, K/9, BB/9 and HR/9
+ * all describe one quantity (how many runs a starter prevents) and FIP is built
+ * from the other three, so the terms are summed under one ceiling instead of
+ * stacking independently.
+ */
+const MAX_STARTER_BUNDLE_LOGIT = MAX_FEATURE_LOGIT.starterEra + MAX_FEATURE_LOGIT.k9;
+
+// Empirical-Bayes shrinkage priors (phantom IP of league-average performance),
+// per stat because they stabilise at very different rates. MUST match the
+// PRIOR_IP_* constants in src/lib/analysis.ts.
+const PRIOR_IP_ERA = 100;
+const PRIOR_IP_FIP = 80;
+const PRIOR_IP_K9 = 60;
+const PRIOR_IP_BB9 = 55;
+const PRIOR_IP_HR9 = 130;
+const SMALL_SAMPLE_IP = 20;
+
+/** Conventional FIP offset (league-average ERA constant) — matches analysis.ts. */
+const FIP_CONSTANT = 3.1;
 
 // Edge thresholds for confidence grades
 const EDGE_A = 8;
 const EDGE_B = 5;
 const EDGE_C = 3;
+
+/**
+ * Feature-set version this backtest mirrors, stamped into the calibration file
+ * so the app can tell whether a fitted calibration still matches the model it
+ * is applied to.
+ *
+ *   1 = win rate, R/G, starter ERA, K/9, bullpen ERA
+ *   2 = the v2 starter package: FIP, BB/9 and HR/9 added alongside ERA and
+ *       K/9, the five terms combined under a shared logit budget, and every
+ *       starter rate stat shrunk toward league average by innings pitched
+ *
+ * MUST equal MODEL_FEATURE_SET in src/lib/analysis.ts. Do not bump this constant
+ * without first updating computeRawLogit, the coefficient list, the shrinkage
+ * priors and runModel's input assembly above/below to match analysis.ts exactly
+ * — a calibration fitted on one feature set is not valid for another, and the
+ * app flags the mismatch as stale.
+ */
+const FEATURE_SET_VERSION = 2;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -85,15 +134,84 @@ function formatOdds(odds) {
 }
 
 /**
+ * Parse a numeric API field, returning null instead of NaN/0-for-missing —
+ * mirrors numOrNull in src/lib/mlb.ts. `parseFloat(s.era) || null` would turn a
+ * genuine 0.00 ERA into "missing", which changes the model inputs.
+ */
+function numOrNull(v) {
+  if (v == null || v === "") return null;
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Parse MLB's `inningsPitched`, which uses baseball notation where the
+ * fractional digit is thirds: "123.1" = 123 1/3 innings, "123.2" = 123 2/3.
+ * Mirrors parseInningsPitched in src/lib/mlb.ts.
+ */
+function parseInningsPitched(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = /^(\d+)(?:\.([0-2]))?$/.exec(s);
+  if (!m) return null;
+  const whole = Number(m[1]);
+  const third = m[2] ? Number(m[2]) : 0;
+  return whole + third / 3;
+}
+
+/** Per-nine rate from a counting stat, or null when it can't be computed. */
+function per9(count, ip) {
+  if (count == null || ip == null || ip <= 0) return null;
+  return (count / ip) * 9;
+}
+
+/**
+ * Sum a group of pitching terms under a shared logit budget — mirrors
+ * capStarterBundle in src/lib/analysis.ts. Positive and negative contributions
+ * are bounded separately, so one big opposite-signed term cannot cancel another
+ * and slip past the cap.
+ */
+function capStarterBundle(terms, budget = MAX_STARTER_BUNDLE_LOGIT) {
+  const positive = terms.filter((t) => t > 0).reduce((a, b) => a + b, 0);
+  const negative = terms.filter((t) => t < 0).reduce((a, b) => a + b, 0);
+  const worst = Math.max(positive, -negative);
+  const scale = worst > budget ? budget / worst : 1;
+  return (positive + negative) * scale;
+}
+
+/**
+ * Regress a pitcher stat toward the league average by sample size (innings
+ * pitched) — mirrors shrinkStat in src/lib/analysis.ts. Without this the
+ * backtest would fit a model that is not the one production runs: a 16-inning
+ * 0.56 ERA would move the backtest probability at full strength while the app
+ * regresses it to near league average.
+ */
+function shrinkStat(stat, ip, leagueAvg, priorIp) {
+  if (stat == null) return null;
+  if (ip == null) return stat;
+  const n = Math.max(0, ip);
+  const weight = n / (n + priorIp);
+  return stat * weight + leagueAvg * (1 - weight);
+}
+
+/**
  * Compute raw log-odds (z-score) for one side — mirrors computeRawLogit
- * from src/lib/analysis.ts.
+ * from src/lib/analysis.ts, including the shared starter-package budget.
  */
 function computeRawLogit(t, o, isHome) {
   let z = isHome ? HOME_ADV : 0;
   z += clampFeature((t.winRate - o.winRate) * COEF_WIN_RATE, MAX_FEATURE_LOGIT.winRate);
   z += clampFeature((t.runsPerGame - o.runsPerGame) * COEF_RUNS_PER_GAME, MAX_FEATURE_LOGIT.runsPerGame);
-  z += clampFeature((o.starterEra - t.starterEra) * COEF_STARTER_ERA, MAX_FEATURE_LOGIT.starterEra);
-  z += clampFeature((t.k9 - o.k9) * COEF_K9, MAX_FEATURE_LOGIT.k9);
+  // Starting-pitcher package. Lower is better for ERA/FIP/BB9/HR9 (so the
+  // opponent's value is subtracted), higher is better for K/9.
+  z += capStarterBundle([
+    clampFeature((o.starterEra - t.starterEra) * COEF_STARTER_ERA, MAX_FEATURE_LOGIT.starterEra),
+    clampFeature((o.fip - t.fip) * COEF_FIP, MAX_FEATURE_LOGIT.fip),
+    clampFeature((t.k9 - o.k9) * COEF_K9, MAX_FEATURE_LOGIT.k9),
+    clampFeature((o.bb9 - t.bb9) * COEF_BB9, MAX_FEATURE_LOGIT.bb9),
+    clampFeature((o.hr9 - t.hr9) * COEF_HR9, MAX_FEATURE_LOGIT.hr9),
+  ]);
   z += clampFeature((o.bullpenEra - t.bullpenEra) * COEF_BULLPEN_ERA, MAX_FEATURE_LOGIT.bullpenEra);
   return z;
 }
@@ -256,8 +374,13 @@ async function fetchTeamStats(teamName, season) {
 }
 
 /**
- * Fetch a pitcher's ERA and K/9 for a season. Falls back to prior season.
- * Returns { era, k9 } or null.
+ * Fetch a pitcher's season rate stats for a season, falling back to the prior
+ * season when the current one has no line yet.
+ *
+ * Returns { era, k9, bb9, hr9, fip, ip } or null. Everything returned is either
+ * a real published value, computed from real counting stats (FIP), or null —
+ * mirrors fetchPitcherStats in src/lib/mlb.ts so the calibration is fitted on
+ * the same inputs production runs.
  */
 const pitcherCache = new Map();
 async function fetchPitcherStats(pitcherId, season) {
@@ -268,17 +391,34 @@ async function fetchPitcherStats(pitcherId, season) {
   for (const yr of [season, season - 1]) {
     const url = `${MLB_API}/people/${pitcherId}/stats?stats=season&group=pitching&season=${yr}&gameType=R`;
     const data = await fetchJSON(url);
-    if (data?.stats?.[0]?.splits?.[0]) {
-      const s = data.stats[0].splits[0].stat;
-      const era = parseFloat(s.era) || null;
-      const k9 = parseFloat(s.strikeoutsPer9Inn) || null;
-      if (era != null || k9 != null) {
-        const result = { era, k9 };
-        pitcherCache.set(key, result);
-        return result;
-      }
+    const s = data?.stats?.[0]?.splits?.[0]?.stat;
+    if (!s) continue;
+
+    const ip = parseInningsPitched(s.inningsPitched);
+    const hr = numOrNull(s.homeRuns);
+    const bb = numOrNull(s.baseOnBalls);
+    const hbp = numOrNull(s.hitByPitch);
+    const so = numOrNull(s.strikeOuts);
+
+    const result = {
+      era: numOrNull(s.era),
+      k9: numOrNull(s.strikeoutsPer9Inn),
+      bb9: numOrNull(s.walksPer9Inn) ?? per9(bb, ip),
+      hr9: numOrNull(s.homeRunsPer9) ?? per9(hr, ip),
+      // FIP from real counting stats only: (13*HR + 3*(BB+HBP) - 2*SO)/IP + C
+      fip:
+        ip != null && ip > 0 && hr != null && bb != null && so != null
+          ? (13 * hr + 3 * (bb + (hbp ?? 0)) - 2 * so) / ip + FIP_CONSTANT
+          : null,
+      ip,
+    };
+
+    if (result.era != null || result.k9 != null || result.fip != null || result.ip != null) {
+      pitcherCache.set(key, result);
+      return result;
     }
   }
+
   pitcherCache.set(key, null);
   return null;
 }
@@ -287,7 +427,8 @@ async function fetchPitcherStats(pitcherId, season) {
 
 function runModel(inputs) {
   const { awayTeam, homeTeam, awayRecord, homeRecord, awayPitcher, homePitcher, awayPitcherId, homePitcherId,
-          awayEra, homeEra, awayK9, homeK9, awayRpg, homeRpg, awayBpEra, homeBpEra, season } = inputs;
+          awayEra, homeEra, awayK9, homeK9, awayFip, homeFip, awayBb9, homeBb9, awayHr9, homeHr9,
+          awayIp, homeIp, awayRpg, homeRpg, awayBpEra, homeBpEra, season } = inputs;
 
   // Parse records
   const [awayW, awayL] = (awayRecord || "").split("-").map(Number);
@@ -300,23 +441,29 @@ function runModel(inputs) {
   const awayWinRate = awayW / awayGames;
   const homeWinRate = homeW / homeGames;
 
-  // Build model inputs (same logic as teamInputs in analysis.ts)
-  const awayInputs = {
-    winRate: awayWinRate,
-    runsPerGame: awayRpg ?? LEAGUE_AVG.runsPerGame,
-    starterEra: awayEra ?? LEAGUE_AVG.starterEra,
-    k9: awayK9 ?? LEAGUE_AVG.k9,
-    bullpenEra: awayBpEra ?? LEAGUE_AVG.bullpenEra,
-    complete: awayRpg != null && awayEra != null && awayK9 != null && awayBpEra != null,
+  // Build model inputs (same logic as teamInputs in analysis.ts). Every starter
+  // rate stat is regressed toward its league baseline by innings pitched, so a
+  // small sample cannot masquerade as an elite arm in the fit.
+  const buildSide = (winRate, rpg, era, fip, k9, bb9, hr9, bpEra, ip) => {
+    const present = [winRate, rpg, era, k9, bpEra].filter((v) => v != null).length;
+    const smallSample = ip != null && ip < SMALL_SAMPLE_IP;
+    return {
+      winRate,
+      runsPerGame: rpg ?? LEAGUE_AVG.runsPerGame,
+      starterEra: shrinkStat(era, ip, LEAGUE_AVG.starterEra, PRIOR_IP_ERA) ?? LEAGUE_AVG.starterEra,
+      fip: shrinkStat(fip, ip, LEAGUE_AVG.fip, PRIOR_IP_FIP) ?? LEAGUE_AVG.fip,
+      k9: shrinkStat(k9, ip, LEAGUE_AVG.k9, PRIOR_IP_K9) ?? LEAGUE_AVG.k9,
+      bb9: shrinkStat(bb9, ip, LEAGUE_AVG.bb9, PRIOR_IP_BB9) ?? LEAGUE_AVG.bb9,
+      hr9: shrinkStat(hr9, ip, LEAGUE_AVG.hr9, PRIOR_IP_HR9) ?? LEAGUE_AVG.hr9,
+      bullpenEra: bpEra ?? LEAGUE_AVG.bullpenEra,
+      complete: present >= 4 && !smallSample,
+      smallSample,
+      starterMetrics: [era, fip, k9, bb9, hr9].filter((v) => v != null).length,
+    };
   };
-  const homeInputs = {
-    winRate: homeWinRate,
-    runsPerGame: homeRpg ?? LEAGUE_AVG.runsPerGame,
-    starterEra: homeEra ?? LEAGUE_AVG.starterEra,
-    k9: homeK9 ?? LEAGUE_AVG.k9,
-    bullpenEra: homeBpEra ?? LEAGUE_AVG.bullpenEra,
-    complete: homeRpg != null && homeEra != null && homeK9 != null && homeBpEra != null,
-  };
+
+  const awayInputs = buildSide(awayWinRate, awayRpg, awayEra, awayFip, awayK9, awayBb9, awayHr9, awayBpEra, awayIp);
+  const homeInputs = buildSide(homeWinRate, homeRpg, homeEra, homeFip, homeK9, homeBb9, homeHr9, homeBpEra, homeIp);
 
   // Compute normalised model probabilities
   const zAway = computeRawLogit(awayInputs, homeInputs, false);
@@ -334,9 +481,13 @@ function runModel(inputs) {
     awayProb, homeProb,
     awayWinRate, homeWinRate,
     awayEra: awayInputs.starterEra, homeEra: homeInputs.starterEra,
+    awayFip: awayInputs.fip, homeFip: homeInputs.fip,
     awayK9: awayInputs.k9, homeK9: homeInputs.k9,
+    awayBb9: awayInputs.bb9, homeBb9: homeInputs.bb9,
+    awayHr9: awayInputs.hr9, homeHr9: homeInputs.hr9,
     awayRpg: awayInputs.runsPerGame, homeRpg: homeInputs.runsPerGame,
     awayBpEra: awayInputs.bullpenEra, homeBpEra: homeInputs.bullpenEra,
+    smallSample: awayInputs.smallSample || homeInputs.smallSample,
     complete,
     awayScore: inputs.awayScore ?? 0,
     homeScore: inputs.homeScore ?? 0,
@@ -421,6 +572,49 @@ function fitPlattScaling(gamesWithStats) {
   return { A, B, brierBefore, brierAfter, logLossBefore, logLossAfter, samples: data.length };
 }
 
+/**
+ * Reliability (calibration) buckets, persisted so the app's debug view can draw
+ * a reliability diagram without re-running a backtest.
+ *
+ * Each game contributes two samples (home + away). Samples are grouped by the
+ * model's 5%-rounded probability bucket; per bucket we record the mean raw
+ * predicted probability, the mean calibrated probability, the observed win
+ * rate and the sample count. A reliability diagram plots `rawProb` (x) against
+ * `actual` (y): the diagonal is perfect calibration, a point above it means the
+ * model was under-confident, below it over-confident. `calibratedProb` is the
+ * same x-position after Platt scaling, so the two points' horizontal offset is
+ * exactly what the calibration currently does.
+ */
+function computeReliability(gamesWithStats, platt) {
+  const buckets = {};
+  for (const g of gamesWithStats) {
+    const samples = [
+      { logit: Math.log(g.homeProb / (100 - g.homeProb)), outcome: g.homeWinner ? 1 : 0 },
+      { logit: Math.log(g.awayProb / (100 - g.awayProb)), outcome: g.homeWinner ? 0 : 1 },
+    ];
+    for (const d of samples) {
+      const rawProb = 1 / (1 + Math.exp(-d.logit));
+      const calProb = platt ? 1 / (1 + Math.exp(-(platt.A * d.logit + platt.B))) : rawProb;
+      const key = Math.round(rawProb * 20) * 5; // nearest 5%
+      if (!buckets[key]) buckets[key] = { raw: [], cal: [], outcomes: [] };
+      buckets[key].raw.push(rawProb * 100);
+      buckets[key].cal.push(calProb * 100);
+      buckets[key].outcomes.push(d.outcome);
+    }
+  }
+  const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  return Object.entries(buckets)
+    .map(([key, b]) => ({
+      bucket: parseInt(key, 10),
+      count: b.outcomes.length,
+      rawProb: mean(b.raw),
+      calibratedProb: mean(b.cal),
+      actual: mean(b.outcomes) * 100,
+    }))
+    .filter((b) => b.count >= 3)
+    .sort((a, b) => a.bucket - b.bucket);
+}
+
 function pct(n) { return (n * 100).toFixed(1) + "%"; }
 
 // ─── CFB / NFL (ESPN) — data fetchers ───────────────────────────────────────
@@ -440,6 +634,8 @@ const FOOTBALL_CONFIG = {
     label: "CFB",
     banner: "CFB Model Backtest",
     calibrationFile: "calibration-cfb.json",
+    /** Feature-set version of the CFB model (cfbAnalysis.ts), not MLB's. */
+    featureSet: 1,
     moduleLabel: "cfbAnalysis.ts",
     leagueAvg: { winRate: 0.5, ppg: 28.0 },
     homeAdv: 0.42,
@@ -451,6 +647,8 @@ const FOOTBALL_CONFIG = {
     label: "NFL",
     banner: "NFL Model Backtest",
     calibrationFile: "calibration-nfl.json",
+    /** Feature-set version of the NFL model (nflAnalysis.ts), not MLB's. */
+    featureSet: 1,
     moduleLabel: "nflAnalysis.ts",
     leagueAvg: { winRate: 0.5, ppg: 23.0 },
     homeAdv: 0.33,
@@ -812,6 +1010,10 @@ async function reportFootball(cfg, gamesWithStats, from, to, opts) {
     const calibrationData = {
       version: 1,
       fittedAt: new Date().toISOString(),
+      // Each sport stamps its OWN feature-set version. Using the MLB constant
+      // here would label a football fit with a version that describes an
+      // unrelated model.
+      featureSet: cfg.featureSet,
       trainingPeriod: { from, to },
       trainingGames: total,
       trainingSamples: platt.samples,
@@ -822,6 +1024,7 @@ async function reportFootball(cfg, gamesWithStats, from, to, opts) {
         logLossBefore: platt.logLossBefore,
         logLossAfter: platt.logLossAfter,
       },
+      reliability: computeReliability(gamesWithStats, platt),
     };
     await writeFile(calibrationPath, JSON.stringify(calibrationData, null, 2) + "\n");
     console.log(`  ✓ Calibration saved to ${calibrationPath}`);
@@ -1054,8 +1257,16 @@ async function main() {
       homePitcherId: game.homePitcherId,
       awayEra: awayPitcherStats?.era ?? null,
       homeEra: homePitcherStats?.era ?? null,
+      awayFip: awayPitcherStats?.fip ?? null,
+      homeFip: homePitcherStats?.fip ?? null,
       awayK9: awayPitcherStats?.k9 ?? null,
       homeK9: homePitcherStats?.k9 ?? null,
+      awayBb9: awayPitcherStats?.bb9 ?? null,
+      homeBb9: homePitcherStats?.bb9 ?? null,
+      awayHr9: awayPitcherStats?.hr9 ?? null,
+      homeHr9: homePitcherStats?.hr9 ?? null,
+      awayIp: awayPitcherStats?.ip ?? null,
+      homeIp: homePitcherStats?.ip ?? null,
       awayRpg: awayTeamStats?.rpg ?? null,
       homeRpg: homeTeamStats?.rpg ?? null,
       awayBpEra: awayTeamStats?.bullpenEra ?? null,
@@ -1331,6 +1542,7 @@ async function main() {
     const calibrationData = {
       version: 1,
       fittedAt: new Date().toISOString(),
+      featureSet: FEATURE_SET_VERSION,
       trainingPeriod: { from, to },
       trainingGames: total,
       trainingSamples: platt.samples,
@@ -1341,6 +1553,7 @@ async function main() {
         logLossBefore: platt.logLossBefore,
         logLossAfter: platt.logLossAfter,
       },
+      reliability: computeReliability(gamesWithStats, platt),
     };
     await writeFile(calibrationPath, JSON.stringify(calibrationData, null, 2) + "\n");
     console.log(`  ✓ Calibration saved to ${calibrationPath}`);

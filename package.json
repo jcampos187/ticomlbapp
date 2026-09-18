@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "vitest run",
     "capture": "node scripts/capture-picks.mjs",
     "grade": "node scripts/grade-picks.mjs",
     "tracker": "node scripts/serve-tracker.mjs --open",
@@ -24,6 +25,7 @@
     "autoprefixer": "^10.4.0",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.9"
   }
 }
