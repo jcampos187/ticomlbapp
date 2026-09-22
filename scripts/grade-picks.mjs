@@ -11,6 +11,9 @@
  * - Moneyline / Spread / Total rows grade from the final score.
  * - Strikeout props grade via the MLB Stats API boxscore (free, no key);
  *   if the feed has no pitcher lines the row stays pending.
+ * - CFB/NFL player props grade from the ESPN game summary's box score
+ *   (passing/rushing/receiving yards, TDs, receptions); any player or market
+ *   we can't resolve is left pending for you to grade by hand.
  * - Parlays grade the moment ANY final leg loses (parlay is dead);
  *   a parlay wins only once every leg is final and won.
  *
@@ -155,6 +158,68 @@ async function mlbPitcherKs(gamePk) {
   }
 }
 
+/** Box-score stat index per prop market. Keys are ESPN's machine-readable
+ *  stat keys (`boxscore.players[].statistics[].keys`), which sit at the same
+ *  index as the athlete's `stats` array. The human labels ("YDS", "TD") are
+ *  display-only and shifting between feeds, so never key off those. */
+const PROP_STATS = {
+  "Passing Yards": ["passing", "passingYards"],
+  "Passing TDs": ["passing", "passingTouchdowns"],
+  "Rushing Yards": ["rushing", "rushingYards"],
+  "Rushing TDs": ["rushing", "rushingTouchdowns"],
+  "Receiving Yards": ["receiving", "receivingYards"],
+  "Receiving TDs": ["receiving", "receivingTouchdowns"],
+  "Receptions": ["receiving", "receptions"],
+};
+
+const summaryCache = new Map();
+
+/** A player's stat for one prop market in a finished ESPN football game.
+ *  Returns null when the game/market/player can't be resolved, so the caller
+ *  leaves the row pending instead of guessing a result. */
+async function footballPropStat(sport, eventId, playerName, market) {
+  const spec = PROP_STATS[market];
+  if (!spec) return null;
+  const [group, key] = spec;
+
+  let summary = summaryCache.get(eventId);
+  if (summary === undefined) {
+    try {
+      summary = await fetchJSON(SUMMARY(sport, eventId));
+    } catch {
+      summary = null;
+    }
+    summaryCache.set(eventId, summary);
+  }
+  if (!summary) return null;
+
+  const want = norm(playerName);
+  const last = norm(String(playerName).split(/\s+/).pop());
+  const lastNameHits = (rows) => rows.filter((a) => norm(a.athlete.displayName).endsWith(last));
+
+  for (const team of summary.boxscore?.players || []) {
+    for (const stat of team.statistics || []) {
+      if (stat.name !== group) continue;
+      const i = (stat.keys || []).indexOf(key);
+      if (i < 0) continue;
+      const rows = (stat.athletes || []).filter((a) => a.athlete);
+      const byLast = lastNameHits(rows);
+      // Exact name first; the last-name fallback only when it's unambiguous
+      // (two different Joneses must not silently grade the wrong one).
+      const hit =
+        rows.find((a) => norm(a.athlete.displayName) === want) ||
+        rows.find((a) => norm(a.athlete.shortName) === want) ||
+        (byLast.length === 1 ? byLast[0] : undefined);
+      if (!hit) continue;
+      const raw = hit.stats?.[i];
+      if (raw == null || raw === "") return null;
+      const val = Number(String(raw).replace(/[^0-9.-]/g, ""));
+      return Number.isFinite(val) ? val : null;
+    }
+  }
+  return null;
+}
+
 /** Match a pitcher name to a K count from the boxscore map. */
 function lookupPitcherKs(ksMap, pitcherName) {
   const want = norm(pitcherName);
@@ -246,6 +311,11 @@ function parsePick(category, pick) {
   if (category === "Strikeout Prop") {
     const m = p.match(/^(.+?)\s+\(([^)]+)\)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+Ks?\s+vs\s+(.+)$/);
     if (m) return { type: "k", pitcher: m[1], team: m[2], dir: m[3], line: Number(m[4]), opp: m[5] };
+  }
+  if (category === "Prop") {
+    // "Matthew Stafford Over 2.5 Passing TDs (LAR)"
+    const m = p.match(/^(.+?)\s+(Over|Under)\s+(\d+(?:\.\d+)?)\s+(.+?)\s+\(([^)]+)\)$/);
+    if (m) return { type: "prop", player: m[1], dir: m[2], line: Number(m[3]), market: m[4], team: m[5] };
   }
   if (category === "Parlay") {
     const colon = p.indexOf(": ");
@@ -485,6 +555,20 @@ async function main() {
           const ks = await pitcherKs(row.sport, m.game.id, parsed.pitcher);
           if (ks == null) { why = "final box has no pitcher lines — grade manually"; }
           else { const over = ks > parsed.line; status = parsed.dir === "Over" ? (over ? "W" : "L") : (over ? "L" : "W"); }
+        }
+      }
+    } else if (parsed.type === "prop") {
+      const m = matchGame(games, parsed.team, parsed.opp, row.date);
+      if (!m) { why = "game not found on slate"; }
+      else if (m.game.state !== "post") { why = m.game.status; }
+      else {
+        const val = await footballPropStat(row.sport, m.game.id, parsed.player, parsed.market);
+        if (val == null) {
+          why = `${parsed.market} not found for ${parsed.player} in the box score — grade manually`;
+        } else {
+          const over = val > parsed.line;
+          status = parsed.dir === "Over" ? (over ? "W" : "L") : (over ? "L" : "W");
+          console.log(`  ✓ ${parsed.player}: ${val} ${parsed.market} (line: ${parsed.line}) → ${status}`);
         }
       }
     } else if (parsed.type === "parlay") {

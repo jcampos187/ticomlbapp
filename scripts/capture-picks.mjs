@@ -130,6 +130,16 @@ function gridRows(d, sport, dateFallback) {
       sport,
       category: "Moneyline",
       pick: `${p.team} ML (${fmtOdds(p.ml)}) vs ${p.opponent}`,
+      // Same model metrics MLB rows carry, so CFB/NFL picks captured here can
+      // be bucketed by edge/EV once those sports' models emit edges again.
+      ml: p.ml,
+      modelProb: p.modelProb,
+      rawMarketProb: p.rawMarketProb,
+      fairMarketProb: p.fairMarketProb,
+      edge: p.edge,
+      ev: p.ev,
+      confidence: p.confidence,
+      dataQuality: p.dataQuality,
     });
   }
   for (const p of d.topAts || []) {
@@ -140,6 +150,8 @@ function gridRows(d, sport, dateFallback) {
       sport,
       category: "Spread",
       pick: `${p.line} vs ${p.opponent}`,
+      spread: p.spread,
+      score: p.score,
     });
   }
   for (const p of d.topTotals || []) {
@@ -150,6 +162,8 @@ function gridRows(d, sport, dateFallback) {
       sport,
       category: "Total",
       pick: `${p.away} @ ${p.home} ${p.pick} ${p.overUnder}`,
+      overUnder: p.overUnder,
+      score: p.score,
     });
   }
   for (const p of d.topProps || []) {
@@ -160,6 +174,11 @@ function gridRows(d, sport, dateFallback) {
       sport,
       category: "Prop",
       pick: `${p.player} ${p.direction} ${p.projectedLine} ${p.market} (${p.team})`,
+      projectedLine: p.projectedLine,
+      playerAvg: p.playerAvg,
+      matchup: p.matchup,
+      statsSeason: p.statsSeason,
+      score: p.score,
     });
   }
   // Anchor parlays to the earliest game date this sport's picks actually use.
@@ -236,14 +255,19 @@ async function main() {
       if (dryRun) {
         console.log(`    would add [${row.date}] ${row.sport} ${row.category}: ${row.pick}`);
       } else {
-        byId.set(row.id, {
-          id: row.id,
-          date: row.date,
-          sport: row.sport,
-          category: row.category,
-          pick: row.pick,
+        // Spread whatever extra fields the row builder attached (edge, EV,
+        // model probs, projected line…) instead of naming them here — a
+        // hardcoded list silently dropped every metric the selectors produced.
+        const { id, date, sport: rowSport, category, pick, ...metrics } = row;
+        byId.set(id, {
+          id,
+          date,
+          sport: rowSport,
+          category,
+          pick,
           status: "pending",
           createdAt: new Date().toISOString(),
+          ...metrics,
         });
       }
       added++;

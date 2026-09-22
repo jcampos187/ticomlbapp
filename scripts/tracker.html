@@ -36,6 +36,8 @@
   .sport-tag.CFB { background: #332a1d; color: #ffd27c; }
   .cat { font-size: 11px; color: var(--muted); min-width: 80px; }
   .pick-text { flex: 1; font-size: 13px; }
+  /* Model numbers captured alongside the pick (edge/EV/grade), when present. */
+  .metrics { font-size: 11px; color: var(--muted); white-space: nowrap; }
   .status { font-size: 11px; font-weight: 700; min-width: 28px; text-align: center; }
   .status.W { color: var(--green); }
   .status.L { color: var(--red); }
@@ -117,6 +119,7 @@ function render() {
         '<span class="sport-tag ' + p.sport + '">' + p.sport + '</span>' +
         '<span class="cat">' + p.category + '</span>' +
         '<span class="pick-text">' + esc(p.pick) + '</span>' +
+        metricChip(p) +
         badge +
         '<span class="btns">' + btns + '</span></div>';
     }).join("");
@@ -127,6 +130,18 @@ function render() {
 }
 
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+/** The model numbers saved with a pick, so a row can be judged after the
+ *  fact (did high-edge picks actually win?). Older rows have none. */
+function metricChip(p) {
+  var signed = function (v) { return (v > 0 ? "+" : "") + Number(v).toFixed(1) + "%"; };
+  var bits = [];
+  if (p.edge != null) bits.push("edge " + signed(p.edge));
+  if (p.ev != null) bits.push("EV " + signed(p.ev));
+  if (p.confidence) bits.push("grade " + esc(p.confidence));
+  if (!bits.length) return "";
+  return '<span class="metrics">' + bits.join(" · ") + '</span>';
+}
 function setSport(s) { filterSport = s; render(); }
 function setStatus(s) { filterStatus = s; render(); }
 
