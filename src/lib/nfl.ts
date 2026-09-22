@@ -1,3 +1,6 @@
+import { mapWithConcurrency } from "./concurrency";
+import type { SrsGame } from "./srs";
+
 const SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard";
 const CORE_BASE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 const ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams";
@@ -5,9 +8,9 @@ const ROSTER_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/t
 // NOTE: Do NOT set a custom User-Agent header here. ESPN's edge (Akamai)
 // fingerprint-checks the UA against the HTTP client and returns 403 for any
 // custom value. The runtime's default UA is allowed. (Same rule as MLB.)
-async function fetchJson(url: string): Promise<any> {
+async function fetchJson(url: string, revalidate = 300): Promise<any> {
   const resp = await fetch(url, {
-    next: { revalidate: 300 },
+    next: { revalidate },
   });
   if (!resp.ok) throw new Error(`ESPN NFL API error: ${resp.status} ${resp.statusText}`);
   return resp.json();
@@ -82,6 +85,82 @@ export async function fetchNflScoreboard(week: number): Promise<RawNflGame[]> {
     });
   }
 
+  return games;
+}
+
+// ─── Season results (the opponent-adjustment graph) ─────────────────
+
+/** First day of an NFL season sweep — Week 1 is early September. */
+const NFL_SEASON_START = "09-01";
+
+/** Cap on days swept. Bounds a malformed season year into known requests. */
+const MAX_SEASON_DAYS = 200;
+
+/** Concurrent season-scoreboard fetches. */
+const SEASON_GRAPH_CONCURRENCY = 8;
+
+/** Every day (YYYYMMDD) from start to end inclusive, capped at `maxDays`. */
+function eachDay(start: string, end: string, maxDays: number): string[] {
+  const first = new Date(`${start}T00:00:00Z`);
+  const last = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(first.getTime()) || Number.isNaN(last.getTime()) || last < first) return [];
+
+  const days: string[] = [];
+  for (const d = new Date(first); d <= last && days.length < maxDays; d.setUTCDate(d.getUTCDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10).replace(/-/g, ""));
+  }
+  return days;
+}
+
+/**
+ * Every completed NFL game of the season, as the raw material for the
+ * opponent-adjusted margin (see `computeOpponentAdjustedMargins`).
+ *
+ * The week query (`?week=N`) returns the slate but no scores, so like CFB this
+ * sweeps one day at a time. Completed days are immutable and cached for a day,
+ * so the sweep is paid once warm; unfinished games are skipped because a rating
+ * built from future results would be look-ahead.
+ */
+export async function fetchNflSeasonResults(seasonYear: number): Promise<SrsGame[]> {
+  const today = new Date().toISOString().slice(0, 10);
+  const start = `${seasonYear}-${NFL_SEASON_START}`;
+  const days = eachDay(start, today, MAX_SEASON_DAYS);
+  if (days.length === 0) return [];
+
+  const settled = await mapWithConcurrency(days, SEASON_GRAPH_CONCURRENCY, async day => {
+    const isToday = day === today.replace(/-/g, "");
+    try {
+      const data = await fetchJson(
+        `${SCOREBOARD_URL}?dates=${day}&seasontype=2&season=${seasonYear}`,
+        isToday ? 300 : 86400,
+      );
+      return (data.events || []) as any[];
+    } catch {
+      // One unreadable day must not take the whole analysis down.
+      return [];
+    }
+  });
+
+  const games: SrsGame[] = [];
+  for (const events of settled) {
+    for (const event of events) {
+      if (event.status?.type?.state !== "post") continue;
+      const comp = event.competitions?.[0];
+      if (!comp) continue;
+      const away = comp.competitors?.find((c: any) => c.homeAway === "away");
+      const home = comp.competitors?.find((c: any) => c.homeAway === "home");
+      if (!away || !home) continue;
+
+      const awayTeamId = Number(away.team?.id);
+      const homeTeamId = Number(home.team?.id);
+      const awayScore = Number(away.score);
+      const homeScore = Number(home.score);
+      if (!Number.isFinite(awayTeamId) || !Number.isFinite(homeTeamId)) continue;
+      if (!Number.isFinite(awayScore) || !Number.isFinite(homeScore)) continue;
+
+      games.push({ homeTeamId, awayTeamId, homeScore, awayScore });
+    }
+  }
   return games;
 }
 
@@ -363,6 +442,66 @@ export async function fetchNflPlayerStats(
   }
 }
 
+/**
+ * How many games of prior-season evidence to fold into a thin current sample.
+ * The prior behaves like this many observed games (empirical Bayes): with
+ * PRIOR_SEASON_WEIGHT_GAMES games of history, a player with 1 game this season
+ * keeps 1/7 of the weight on that game, so one 300-yard outburst can't define
+ * a projection while a real breakout still moves it.
+ */
+export const PRIOR_SEASON_WEIGHT_GAMES = 6;
+
+/**
+ * Minimum games for the prior season to count as a prior at all. A 2-game
+ * cameo last year is no steadier evidence than the 1 game we're trying to
+ * stabilise, so below this the current sample is used unchanged.
+ */
+export const MIN_PRIOR_GAMES = 4;
+
+/**
+ * Blend a thin current-season sample with the prior season's per-game rates.
+ *
+ * Props were dark for the first weeks of the season (nobody had MIN_GAMES
+ * games yet), and the alternative — projecting off one game — is what produced
+ * `D'Andre Swift Rushing TDs Over 3.0`. Leaning on last season is the honest
+ * middle: real per-game rates from a full season, weighted down by how little
+ * this season says so far.
+ *
+ * `gamesPlayed` is deliberately left as the CURRENT season's count so the
+ * projection still reports (and warns about) a thin sample.
+ */
+export function blendPlayerStats(
+  current: PlayerSeasonStats,
+  prior: PlayerSeasonStats | null
+): { stats: PlayerSeasonStats; blended: boolean } {
+  if (!prior || prior.gamesPlayed < MIN_PRIOR_GAMES || current.gamesPlayed <= 0) {
+    return { stats: current, blended: false };
+  }
+
+  const weight = current.gamesPlayed + PRIOR_SEASON_WEIGHT_GAMES;
+  const mix = (cur: number | null, pri: number | null): number | null => {
+    if (cur == null) return pri;
+    if (pri == null) return cur;
+    return (cur * current.gamesPlayed + pri * PRIOR_SEASON_WEIGHT_GAMES) / weight;
+  };
+
+  return {
+    blended: true,
+    stats: {
+      gamesPlayed: current.gamesPlayed,
+      passingYardsPerGame: mix(current.passingYardsPerGame, prior.passingYardsPerGame),
+      passingTds: mix(current.passingTds, prior.passingTds),
+      rushingYardsPerGame: mix(current.rushingYardsPerGame, prior.rushingYardsPerGame),
+      rushingTds: mix(current.rushingTds, prior.rushingTds),
+      receivingYardsPerGame: mix(current.receivingYardsPerGame, prior.receivingYardsPerGame),
+      receivingTds: mix(current.receivingTds, prior.receivingTds),
+      // A season total isn't meaningfully blendable; the per-game rate is.
+      receptions: current.receptions ?? prior.receptions,
+      receptionsPerGame: mix(current.receptionsPerGame, prior.receptionsPerGame),
+    },
+  };
+}
+
 export interface TeamSeasonStats {
   /** Own points scored per game (for totals analysis). */
   pointsPerGame: number | null;
@@ -379,6 +518,9 @@ export interface TeamSeasonStats {
   recYdsAllowedPerGame: number | null;
   /** Receptions this defense allows per game (for WR/TE/RB receptions props). */
   recRecsAllowedPerGame: number | null;
+  /** Points this defense allows per game — the defensive half of scoring
+   *  margin for the model edge (offense-only PPG can't see a defense). */
+  pointsAllowedPerGame: number | null;
 }
 
 /**
@@ -422,6 +564,7 @@ export async function fetchNflTeamStats(
 
     return {
       pointsPerGame: own("scoring", "totalPointsPerGame"),
+      pointsAllowedPerGame: opp("scoring", "totalPointsPerGame"),
       passYdsAllowedPerGame: opp("passing", "netPassingYards"),
       rushYdsAllowedPerGame: opp("rushing", "rushingYards"),
       passTdsAllowedPerGame: opp("passing", "passingTouchdowns"),

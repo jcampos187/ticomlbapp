@@ -25,6 +25,18 @@ export interface CfbGame {
   // Team scoring context
   awayPpg: number | null;
   homePpg: number | null;
+  /** Points allowed per game — the defensive half of scoring margin. */
+  awayPpgAllowed: number | null;
+  homePpgAllowed: number | null;
+  /**
+   * Opponent-adjusted net scoring margin (an SRS-style rating in points per
+   * game, centred on 0). This is what the model actually uses — raw margin is
+   * not comparable across schedules, so a blowout of an FCS tune-up would
+   * otherwise read as a contender's result. Null when the team is absent from
+   * the season graph.
+   */
+  awayAdjMargin: number | null;
+  homeAdjMargin: number | null;
   // Conference info
   awayConference: string | null;
   homeConference: string | null;

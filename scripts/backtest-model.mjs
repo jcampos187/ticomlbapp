@@ -634,13 +634,20 @@ const FOOTBALL_CONFIG = {
     label: "CFB",
     banner: "CFB Model Backtest",
     calibrationFile: "calibration-cfb.json",
-    /** Feature-set version of the CFB model (cfbAnalysis.ts), not MLB's. */
-    featureSet: 1,
+    /** Feature-set version of the CFB model (cfbAnalysis.ts), not MLB's.
+     *  v2 replaced the offense-only PPG feature with net scoring margin and
+     *  added per-feature logit caps; v3 made that margin OPPONENT-ADJUSTED
+     *  (SRS-style), so v2 fits no longer describe the model. */
+    featureSet: 3,
     moduleLabel: "cfbAnalysis.ts",
-    leagueAvg: { winRate: 0.5, ppg: 28.0 },
+    // First day of the season swept to build the opponent graph (week 0).
+    seasonStartMonthDay: "-08-15",
+    // League-average ADJUSTED margin is 0 (ratings are centred on zero).
+    leagueAvg: { winRate: 0.5, margin: 0 },
     homeAdv: 0.42,
     coefWinRate: 3.2,
-    coefPpg: 0.16,
+    coefMargin: 0.15,
+    maxFeatureLogit: { winRate: 0.6, margin: 2.0 },
     api: "college-football",
   },
   nfl: {
@@ -648,12 +655,15 @@ const FOOTBALL_CONFIG = {
     banner: "NFL Model Backtest",
     calibrationFile: "calibration-nfl.json",
     /** Feature-set version of the NFL model (nflAnalysis.ts), not MLB's. */
-    featureSet: 1,
+    featureSet: 3,
     moduleLabel: "nflAnalysis.ts",
-    leagueAvg: { winRate: 0.5, ppg: 23.0 },
+    // First day of the season swept to build the opponent graph (week 1).
+    seasonStartMonthDay: "-09-01",
+    leagueAvg: { winRate: 0.5, margin: 0 },
     homeAdv: 0.33,
     coefWinRate: 3.2,
-    coefPpg: 0.13,
+    coefMargin: 0.13,
+    maxFeatureLogit: { winRate: 0.6, margin: 0.6 },
     api: "nfl",
   },
 };
@@ -738,30 +748,127 @@ function footballSeason(dateStr) {
   return m >= 8 ? y : y - 1;
 }
 
-const footballTeamStatCache = new Map();
+/**
+ * Iterations of the opponent-adjustment fixed point.
+ *
+ * MUST equal SRS_ITERATIONS in src/lib/srs.ts. The backtest is a standalone
+ * .mjs script that cannot import the TypeScript model, so this mirrors
+ * `computeOpponentAdjustedMargins` and tests/calculations.test.ts asserts the
+ * shared constant.
+ */
+const SRS_ITERATIONS = 20;
 
-/** Season points-per-game for a team (site API, same source as the app). */
-async function fetchFootballTeamStats(cfg, teamId, season) {
-  if (!teamId) return null;
-  const key = `${cfg.api}|${teamId}|${season}`;
-  if (footballTeamStatCache.has(key)) return footballTeamStatCache.get(key);
-  const data = await espnFetchJson(
-    `https://site.api.espn.com/apis/site/v2/sports/football/${cfg.api}/teams/${teamId}/statistics?season=${season}`
-  );
-  let ppg = null;
-  try {
-    const cats = data?.results?.stats?.categories || [];
-    const scoring = cats.find((c) => c.name === "scoring");
-    const stat = scoring?.stats?.find((s) => s.name === "totalPointsPerGame");
-    if (stat?.value != null) {
-      const n = Number(stat.value);
-      ppg = Number.isNaN(n) ? null : n;
+/**
+ * Empirical-Bayes prior (games) shrinking each rating toward league average by
+ * sample size. MUST equal SRS_PRIOR_GAMES in src/lib/srs.ts.
+ *
+ * CFB has many teams that play exactly one game (FCS schools), whose rating
+ * would otherwise be pinned near -70 by a single blowout and, because ratings
+ * are centred, would inflate every other team.
+ */
+const SRS_PRIOR_GAMES = 10;
+
+/**
+ * Mirror of computeOpponentAdjustedMargins in src/lib/srs.ts.
+ *
+ * rating_i = avg_margin_i + avg(rating of i's opponents), solved by iteration
+ * with re-centring so the ratings stay comparable to a zero league-average. Raw
+ * net margin is NOT comparable across schedules (a blowout of an FCS tune-up
+ * counts as much as a win over a contender), which is why the model uses this
+ * instead.
+ */
+function computeAdjustedMargins(games) {
+  const gamesPlayed = new Map();
+  const marginTotal = new Map();
+  const oppCounts = new Map();
+
+  const bump = (a, b) => {
+    let inner = oppCounts.get(a);
+    if (!inner) {
+      inner = new Map();
+      oppCounts.set(a, inner);
     }
-  } catch {
-    ppg = null;
+    inner.set(b, (inner.get(b) || 0) + 1);
+  };
+
+  for (const g of games) {
+    if (
+      !Number.isFinite(g.homeTeamId) ||
+      !Number.isFinite(g.awayTeamId) ||
+      !Number.isFinite(g.homeScore) ||
+      !Number.isFinite(g.awayScore)
+    ) {
+      continue;
+    }
+    const homeMargin = g.homeScore - g.awayScore;
+    gamesPlayed.set(g.homeTeamId, (gamesPlayed.get(g.homeTeamId) || 0) + 1);
+    gamesPlayed.set(g.awayTeamId, (gamesPlayed.get(g.awayTeamId) || 0) + 1);
+    marginTotal.set(g.homeTeamId, (marginTotal.get(g.homeTeamId) || 0) + homeMargin);
+    marginTotal.set(g.awayTeamId, (marginTotal.get(g.awayTeamId) || 0) - homeMargin);
+    bump(g.homeTeamId, g.awayTeamId);
+    bump(g.awayTeamId, g.homeTeamId);
   }
-  footballTeamStatCache.set(key, ppg);
-  return ppg;
+
+  const ids = [...gamesPlayed.keys()];
+  const ratings = new Map();
+  if (ids.length === 0) return ratings;
+
+  const avgMargin = new Map();
+  for (const id of ids) {
+    const n = gamesPlayed.get(id);
+    avgMargin.set(id, n > 0 ? marginTotal.get(id) / n : 0);
+    ratings.set(id, 0);
+  }
+
+  for (let pass = 0; pass < SRS_ITERATIONS; pass++) {
+    const next = new Map();
+    for (const id of ids) {
+      const n = gamesPlayed.get(id);
+      if (n <= 0) {
+        next.set(id, 0);
+        continue;
+      }
+      let oppSum = 0;
+      for (const [opp, count] of oppCounts.get(id)) {
+        oppSum += count * (ratings.get(opp) || 0);
+      }
+      next.set(id, avgMargin.get(id) + oppSum / n);
+    }
+    let sum = 0;
+    let count = 0;
+    for (const id of ids) {
+      if (gamesPlayed.get(id) > 0) {
+        sum += next.get(id);
+        count++;
+      }
+    }
+    const mean = count > 0 ? sum / count : 0;
+    for (const id of ids) {
+      ratings.set(id, gamesPlayed.get(id) > 0 ? next.get(id) - mean : 0);
+    }
+  }
+
+  // Shrink toward league average by sample size, then re-centre — mirrors
+  // SRS_PRIOR_GAMES in src/lib/srs.ts.
+  if (SRS_PRIOR_GAMES > 0) {
+    let sum = 0;
+    let count = 0;
+    for (const id of ids) {
+      const n = gamesPlayed.get(id);
+      const shrunk = n > 0 ? ratings.get(id) * (n / (n + SRS_PRIOR_GAMES)) : 0;
+      ratings.set(id, shrunk);
+      if (n > 0) {
+        sum += shrunk;
+        count++;
+      }
+    }
+    const mean = count > 0 ? sum / count : 0;
+    for (const id of ids) {
+      ratings.set(id, gamesPlayed.get(id) > 0 ? ratings.get(id) - mean : 0);
+    }
+  }
+
+  return ratings;
 }
 
 /**
@@ -771,28 +878,26 @@ async function fetchFootballTeamStats(cfg, teamId, season) {
  */
 function footballRawLogit(cfg, t, o, isHome) {
   let z = isHome ? cfg.homeAdv : 0;
-  z += (t.winRate - o.winRate) * cfg.coefWinRate;
-  z += (t.ppg - o.ppg) * cfg.coefPpg;
+  z += clampFeature((t.winRate - o.winRate) * cfg.coefWinRate, cfg.maxFeatureLogit.winRate);
+  z += clampFeature((t.margin - o.margin) * cfg.coefMargin, cfg.maxFeatureLogit.margin);
   return z;
 }
 
-function runFootballModel(cfg, game, awayPpg, homePpg) {
+function runFootballModel(cfg, game, awayAdjMargin, homeAdjMargin) {
   const [aw, al] = (game.awayRecord || "").split("-").map(Number);
   const [hw, hl] = (game.homeRecord || "").split("-").map(Number);
   const aGames = Number.isFinite(aw) && Number.isFinite(al) ? aw + al : 0;
   const hGames = Number.isFinite(hw) && Number.isFinite(hl) ? hw + hl : 0;
   if (aGames < MIN_EDGE_GAMES || hGames < MIN_EDGE_GAMES) return null;
 
-  const t = {
-    winRate: aw / aGames,
-    ppg: awayPpg ?? cfg.leagueAvg.ppg,
-    complete: awayPpg != null,
-  };
-  const o = {
-    winRate: hw / hGames,
-    ppg: homePpg ?? cfg.leagueAvg.ppg,
-    complete: homePpg != null,
-  };
+  // Both sides need a real OPPONENT-ADJUSTED rating. It is computed from games
+  // that finished BEFORE this one (see ratingsAsOf), so the prediction never
+  // sees its own result, and raw margin is not a substitute — that is the
+  // schedule-blind feature this model no longer uses.
+  if (awayAdjMargin == null || homeAdjMargin == null) return null;
+
+  const t = { winRate: aw / aGames, margin: awayAdjMargin, complete: true };
+  const o = { winRate: hw / hGames, margin: homeAdjMargin, complete: true };
 
   const zAway = footballRawLogit(cfg, t, o, false);
   const zHome = footballRawLogit(cfg, o, t, true);
@@ -809,8 +914,8 @@ function runFootballModel(cfg, game, awayPpg, homePpg) {
     homeProb,
     awayWinRate: t.winRate,
     homeWinRate: o.winRate,
-    awayPpg: t.ppg,
-    homePpg: o.ppg,
+    awayMargin: t.margin,
+    homeMargin: o.margin,
     complete: t.complete && o.complete,
     awayScore: game.awayScore ?? 0,
     homeScore: game.homeScore ?? 0,
@@ -1098,10 +1203,20 @@ async function runFootball(opts) {
     from = d.toISOString().slice(0, 10);
   }
 
-  const dates = dateRange(from, to);
+  // The opponent graph is swept from the START OF THE SEASON, not from the
+  // evaluation window: a rating built only from games inside the window is
+  // meaningless for the first games in it (no prior results), and the model
+  // would silently fall back to league average. `from` still bounds which games
+  // are SCORED.
+  const season = footballSeason(to);
+  const seasonStart = `${season}${cfg.seasonStartMonthDay}`;
+  const sweepFrom = seasonStart < from ? seasonStart : from;
+
+  const dates = dateRange(sweepFrom, to);
   console.log(`\n╔══════════════════════════════════════════════════════════╗`);
   console.log(`║           ${cfg.banner.padEnd(47)}║`);
   console.log(`║  Period: ${from} → ${to}  (${dates.length} days)`.padEnd(59) + "║");
+  console.log(`║  Opponent graph swept from ${sweepFrom}`.padEnd(59) + "║");
   console.log(`╚══════════════════════════════════════════════════════════╝\n`);
 
   // 1. Fetch all completed games (ESPN regular-season scoreboard).
@@ -1109,8 +1224,8 @@ async function runFootball(opts) {
   const allGames = [];
   let daysProcessed = 0;
   for (const date of dates) {
-    const season = footballSeason(date);
-    const games = await fetchFootballGames(cfg, date, season);
+    const gameSeason = footballSeason(date);
+    const games = await fetchFootballGames(cfg, date, gameSeason);
     allGames.push(...games);
     daysProcessed++;
     if (daysProcessed % 7 === 0) {
@@ -1124,19 +1239,40 @@ async function runFootball(opts) {
     return;
   }
 
-  // 2. Fetch team PPG and run the sport model for each game.
-  console.log("Phase 2/3: Fetching team stats and running the model…");
+  // Only games inside the requested window are scored; the rest exist to give
+  // the first window games an opponent graph to stand on.
+  const testGames = allGames.filter((g) => g.date >= from && g.date <= to);
+
+  // Opponent-adjusted ratings AS OF a date, built only from games that kicked
+  // off on an earlier date. Same-day games are excluded because their final
+  // scores are unknown at prediction time — including them would be look-ahead.
+  const adjCache = new Map();
+  const ratingsAsOf = (date) => {
+    if (adjCache.has(date)) return adjCache.get(date);
+    const prior = allGames
+      .filter((g) => g.date < date)
+      .map((g) => ({
+        homeTeamId: g.homeTeamId,
+        awayTeamId: g.awayTeamId,
+        homeScore: g.homeScore,
+        awayScore: g.awayScore,
+      }));
+    const ratings = computeAdjustedMargins(prior);
+    adjCache.set(date, ratings);
+    return ratings;
+  };
+
+  // 2. Solve the opponent-adjusted margin per game and run the sport model.
+  console.log("Phase 2/3: Building the opponent graph and running the model…");
   const gamesWithStats = [];
   let statsFetched = 0;
 
-  for (const game of allGames) {
-    const season = footballSeason(game.date);
-    const [awayPpg, homePpg] = await Promise.all([
-      fetchFootballTeamStats(cfg, game.awayTeamId, season),
-      fetchFootballTeamStats(cfg, game.homeTeamId, season),
-    ]);
+  for (const game of testGames) {
+    const ratings = ratingsAsOf(game.date);
+    const awayAdj = ratings.has(game.awayTeamId) ? ratings.get(game.awayTeamId) : null;
+    const homeAdj = ratings.has(game.homeTeamId) ? ratings.get(game.homeTeamId) : null;
 
-    const result = runFootballModel(cfg, game, awayPpg, homePpg);
+    const result = runFootballModel(cfg, game, awayAdj, homeAdj);
     if (!result) continue;
 
     const homeWinner = game.homeWinner;
@@ -1153,7 +1289,7 @@ async function runFootball(opts) {
     });
     statsFetched++;
     if (statsFetched % 40 === 0) {
-      process.stdout.write(`  ${statsFetched}/${allGames.length} games processed…\r`);
+      process.stdout.write(`  ${statsFetched}/${testGames.length} games processed…\r`);
     }
   }
   console.log(`  ✓ ${gamesWithStats.length} games with complete model data\n`);

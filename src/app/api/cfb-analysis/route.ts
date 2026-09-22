@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { fetchCfbContext, fetchCfbScoreboard, fetchCfbTeamStats } from "@/lib/cfb";
+import { fetchCfbContext, fetchCfbScoreboard, fetchCfbTeamStats, fetchCfbSeasonResults } from "@/lib/cfb";
+import { computeOpponentAdjustedMargins } from "@/lib/srs";
 import { mapWithConcurrency } from "@/lib/concurrency";
 import { analyzeCfbFavorites, analyzeCfbAts, analyzeCfbTotals, buildCfbParlays, computeCfbModelEdges } from "@/lib/cfbAnalysis";
 import type { CfbGame, CfbAnalysisResult } from "@/lib/cfbTypes";
@@ -40,12 +41,20 @@ export async function GET() {
       ...new Set(gamesWithOdds.flatMap(g => [g.awayTeamId, g.homeTeamId])),
     ].slice(0, MAX_TEAM_STATS);
 
-    const teamStatsResults = await mapWithConcurrency(
-      teamIds,
-      TEAM_STATS_CONCURRENCY,
-      async id => ({ id, stats: await fetchCfbTeamStats(id, ctx.seasonYear) }),
-    );
+    // The season sweep runs alongside the team-stat lookups: raw net margin is
+    // not comparable across schedules, so the model needs an opponent-adjusted
+    // rating built from every completed game this season. Past days are cached
+    // for a day, so this cost is paid once warm, not on every analysis run.
+    const [teamStatsResults, seasonGames] = await Promise.all([
+      mapWithConcurrency(
+        teamIds,
+        TEAM_STATS_CONCURRENCY,
+        async id => ({ id, stats: await fetchCfbTeamStats(id, ctx.seasonYear) }),
+      ),
+      fetchCfbSeasonResults(ctx.seasonYear),
+    ]);
     const teamStatsMap = new Map(teamStatsResults.map(r => [r.id, r.stats]));
+    const adjMargins = computeOpponentAdjustedMargins(seasonGames);
 
     // 5. Assemble CfbGame objects.
     const buildGame = (raw: (typeof rawGames)[number]): CfbGame => {
@@ -75,6 +84,10 @@ export async function GET() {
         provider: raw.provider,
         awayPpg: awayStats?.pointsPerGame ?? null,
         homePpg: homeStats?.pointsPerGame ?? null,
+        awayPpgAllowed: awayStats?.pointsAllowedPerGame ?? null,
+        homePpgAllowed: homeStats?.pointsAllowedPerGame ?? null,
+        awayAdjMargin: adjMargins.get(raw.awayTeamId) ?? null,
+        homeAdjMargin: adjMargins.get(raw.homeTeamId) ?? null,
         awayConference: raw.awayConference,
         homeConference: raw.homeConference,
       };

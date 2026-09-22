@@ -1,6 +1,7 @@
 {
   "version": 1,
-  "fittedAt": "2026-09-09T15:03:39.324Z",
+  "fittedAt": "2026-09-21T16:05:21.449Z",
+  "featureSet": 3,
   "trainingPeriod": {
     "from": "2025-09-04",
     "to": "2025-11-30"
@@ -8,13 +9,106 @@
   "trainingGames": 127,
   "trainingSamples": 254,
   "plattScaling": {
-    "A": 0.6372776150089818,
-    "B": -5.212365971911414e-18
+    "A": 0.9726326545406092,
+    "B": -4.32724722196419e-18
   },
   "metrics": {
-    "brierBefore": 0.22240414965489744,
-    "brierAfter": 0.2118486827588084,
-    "logLossBefore": 0.6415137880522449,
-    "logLossAfter": 0.6095884446783006
-  }
+    "brierBefore": 0.22022274475566003,
+    "brierAfter": 0.2201330179996855,
+    "logLossBefore": 0.6306713815225544,
+    "logLossAfter": 0.6305169063392447
+  },
+  "reliability": [
+    {
+      "bucket": 20,
+      "count": 15,
+      "rawProb": 22.034447478082733,
+      "calibratedProb": 22.634285518299098,
+      "actual": 26.666666666666668
+    },
+    {
+      "bucket": 25,
+      "count": 13,
+      "rawProb": 24.812975244378315,
+      "calibratedProb": 25.38166403945673,
+      "actual": 7.6923076923076925
+    },
+    {
+      "bucket": 30,
+      "count": 36,
+      "rawProb": 28.96643312450706,
+      "calibratedProb": 29.47313373191756,
+      "actual": 33.33333333333333
+    },
+    {
+      "bucket": 35,
+      "count": 19,
+      "rawProb": 34.78160364688773,
+      "calibratedProb": 35.17201548924131,
+      "actual": 42.10526315789473
+    },
+    {
+      "bucket": 40,
+      "count": 15,
+      "rawProb": 39.99674417881997,
+      "calibratedProb": 40.26276980663395,
+      "actual": 53.333333333333336
+    },
+    {
+      "bucket": 45,
+      "count": 24,
+      "rawProb": 45.17708121430008,
+      "calibratedProb": 45.30809073884555,
+      "actual": 41.66666666666667
+    },
+    {
+      "bucket": 50,
+      "count": 10,
+      "rawProb": 50,
+      "calibratedProb": 50,
+      "actual": 50
+    },
+    {
+      "bucket": 55,
+      "count": 24,
+      "rawProb": 54.82291878569989,
+      "calibratedProb": 54.69190926115445,
+      "actual": 58.333333333333336
+    },
+    {
+      "bucket": 60,
+      "count": 15,
+      "rawProb": 60.00325582118004,
+      "calibratedProb": 59.73723019336606,
+      "actual": 46.666666666666664
+    },
+    {
+      "bucket": 65,
+      "count": 19,
+      "rawProb": 65.21839635311227,
+      "calibratedProb": 64.82798451075867,
+      "actual": 57.89473684210527
+    },
+    {
+      "bucket": 70,
+      "count": 36,
+      "rawProb": 71.03356687549292,
+      "calibratedProb": 70.52686626808241,
+      "actual": 66.66666666666666
+    },
+    {
+      "bucket": 75,
+      "count": 13,
+      "rawProb": 75.18702475562168,
+      "calibratedProb": 74.61833596054326,
+      "actual": 92.3076923076923
+    },
+    {
+      "bucket": 80,
+      "count": 15,
+      "rawProb": 77.96555252191726,
+      "calibratedProb": 77.3657144817009,
+      "actual": 73.33333333333333
+    }
+  ]
 }

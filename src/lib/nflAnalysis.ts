@@ -1,5 +1,5 @@
 import { NflGame, NflTopPick, NflAtsPick, NflTotalPick, NflPropPick, NflParlay, NflPropCandidate, NflModelEdge } from "./nflTypes";
-import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability } from "./analysis";
+import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability, clampFeature } from "./analysis";
 import calibration from "./calibration-nfl.json";
 
 // --- Model Edge: logistic win-probability model vs market implied ---
@@ -7,7 +7,10 @@ import calibration from "./calibration-nfl.json";
 // leans on record + scoring output (+ home field).
 const NFL_LEAGUE_AVG = {
   winRate: 0.5,
-  ppg: 23.0,
+  // League-average NET scoring margin is zero by construction — every point
+  // scored is a point somebody allowed. A team with no usable stats is
+  // assumed exactly average instead of being handed a PPG-looking number.
+  margin: 0,
 };
 
 // A record must represent at least this many games before win rate counts as
@@ -20,11 +23,35 @@ const MIN_EDGE_GAMES = 4;
 // coefficient — a win rate is a win rate.
 const NFL_HOME_ADV = 0.33;
 const NFL_COEF_WIN_RATE = 3.2;
-const NFL_COEF_PPG = 0.13;
+/**
+ * Logits per point of OPPONENT-ADJUSTED net scoring margin difference.
+ *
+ * Replaces first the offense-only PPG term (blind to defense — 27 scored/24
+ * allowed was modelled identically to 27/14) and then the raw margin that
+ * followed it, which was not comparable across schedules. The margin feature is
+ * now the SRS-style rating from srs.ts. It is centred on zero, so an unknown
+ * team stays exactly average (NFL_LEAGUE_AVG.margin = 0) and the per-point
+ * range is unchanged.
+ */
+const NFL_COEF_MARGIN = 0.13;
+
+/** Per-feature logit caps, mirroring MAX_FEATURE_LOGIT in analysis.ts (MLB). */
+const MAX_FEATURE_LOGIT = {
+  winRate: 0.6,
+  // Measured on the 2025 season (point-in-time, 129 games): Brier 0.2184 at
+  // 0.4, 0.2181 at 0.6, 0.2185 at 0.8 and 1.2 — against 0.2286 for the raw
+  // margin feature. The plateau is wide (0.4–1.2 within 0.0005), so 0.6 is the
+  // middle rather than a tuned-to-the-decimal value. Ratings are already shrunk
+  // by sample size (SRS_PRIOR_GAMES), which does most of the bounding.
+  margin: 0.6,
+};
 
 interface NflModelInputs {
   winRate: number;
-  ppg: number;
+  /** Opponent-adjusted net scoring margin (points per game, centred on 0). */
+  margin: number;
+  /** True when `margin` is the opponent-adjusted rating rather than raw margin. */
+  adjusted: boolean;
   complete: boolean;
 }
 
@@ -33,12 +60,24 @@ function nflInputs(game: NflGame, side: "away" | "home"): NflModelInputs {
   const [w, l] = winRateRaw.split("-").map(Number);
   const games = Number.isFinite(w) && Number.isFinite(l) ? w + l : 0;
   const winRate = games >= MIN_EDGE_GAMES ? w / games : null;
-  const ppg = side === "away" ? game.awayPpg : game.homePpg;
+
+  // OPPONENT-ADJUSTED margin (SRS-style, see srs.ts), not the raw
+  // scored-minus-allowed average: an unadjusted average is compared against a
+  // sharp price for an opponent the team never played, so its sign can be wrong
+  // however tightly it is capped. Raw margin is not used by the model at all.
+  const adj = side === "away" ? game.awayAdjMargin : game.homeAdjMargin;
+
   return {
     winRate: winRate ?? NFL_LEAGUE_AVG.winRate,
-    ppg: ppg ?? NFL_LEAGUE_AVG.ppg,
-    // Strong data = both sides have record (4+ games) + PPG (4 of 4 inputs).
-    complete: winRate != null && ppg != null,
+    // A missing rating falls back to LEAGUE AVERAGE, never to the raw margin:
+    // substituting raw margin would restore the schedule-blind feature for
+    // exactly the teams whose schedule we failed to read.
+    margin: adj ?? NFL_LEAGUE_AVG.margin,
+    adjusted: adj != null,
+    // Strong data = a real record (4+ games) AND an opponent-adjusted margin.
+    // A raw margin does NOT count: without the adjustment the model compares a
+    // schedule-blind average against the market. Fail closed rather than guess.
+    complete: winRate != null && adj != null,
   };
 }
 /**
@@ -70,8 +109,8 @@ function calibrateLogit(rawLogit: number): number {
 /** Raw log-odds (z-score) for one side of an NFL game — NOT a probability. */
 function nflRawLogit(t: NflModelInputs, o: NflModelInputs, isHome: boolean): number {
   let z = isHome ? NFL_HOME_ADV : 0;
-  z += (t.winRate - o.winRate) * NFL_COEF_WIN_RATE;
-  z += (t.ppg - o.ppg) * NFL_COEF_PPG;
+  z += clampFeature((t.winRate - o.winRate) * NFL_COEF_WIN_RATE, MAX_FEATURE_LOGIT.winRate);
+  z += clampFeature((t.margin - o.margin) * NFL_COEF_MARGIN, MAX_FEATURE_LOGIT.margin);
   return z;
 }
 
@@ -168,8 +207,14 @@ export function computeNflModelEdges(games: NflGame[]): NflModelEdge[] {
 
       const reasons: string[] = [];
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
-      if (t.ppg > o.ppg + 1.5) reasons.push(`${t.ppg.toFixed(1)} PPG offense`);
+      if (t.margin > o.margin + 4) reasons.push(`${t.margin.toFixed(1)} adj. margin`);
+      else if (t.margin > o.margin + 1.5) reasons.push(`${(t.margin - o.margin).toFixed(1)} adj. margin edge`);
       if (side === "home") reasons.push("Home field");
+      // Flag a 10pp+ disagreement exactly as the picks sections do, so the same
+      // edge does not read as routine in one place and alarming in the other.
+      if (edge >= HIGH_EDGE_THRESHOLD) {
+        reasons.push("⚠ HIGH EDGE — needs validation");
+      }
       // One side can clear the floor while the other hasn't. Say why the
       // confidence grade is reduced rather than just showing a B/C.
       if (!(t.complete && o.complete)) {
@@ -410,6 +455,8 @@ interface PropProjection {
   direction: "Over" | "Under";
   matchup: "easy" | "tough";
   score: number;
+  /** Provenance of `playerAvg` — see NflPropPick.statsBasis. */
+  statsBasis: string;
   reasons: string[];
 }
 
@@ -420,14 +467,21 @@ interface PropProjection {
  * gate: at 4 it suppressed EVERY prop for the first month of the season (no
  * player has four games until week 5).
  *
- * Do not drop it to 1. At one game the "per-game average" is a single
- * performance and the opponent's allowance is a single game, which produced
- * `D'Andre Swift Rushing TDs Over 3.0` and `Chris Olave Receiving Yards Over
- * 129` (avg 182) off one week. Two games is the minimum at which a rate means
- * anything, and the projection still reports the games played and flags a thin
- * sample (see THIN_SAMPLE_GAMES below).
+ * Do not drop it to 1 for a player with only one game. At one game the
+ * "per-game average" is a single performance and the opponent's allowance is a
+ * single game, which produced `D'Andre Swift Rushing TDs Over 3.0` and
+ * `Chris Olave Receiving Yards Over 129` (avg 182) off one week. Two games is
+ * the minimum at which a rate means anything, and the projection still reports
+ * the games played and flags a thin sample (see THIN_SAMPLE_GAMES below).
+ *
+ * A player below the floor CAN still qualify when their one game was blended
+ * with last season (see blendPlayerStats / blendedWithPrior): the rate then
+ * rests on a full prior season rather than on a single game, so the objection
+ * above — that one game is not a rate — no longer applies. Blending also has
+ * to already have happened for the flag to be set, so this can't be bypassed
+ * by simply having played once.
  */
-const MIN_GAMES = 2;
+export const MIN_PROP_GAMES = 2;
 
 /** At or below this many games the projection is flagged as a thin sample. */
 const THIN_SAMPLE_GAMES = 4;
@@ -538,7 +592,7 @@ function projectProp(
   player: NflPropCandidate,
   oppDef: OppDef
 ): PropProjection | null {
-  if (player.gamesPlayed < MIN_GAMES) return null;
+  if (player.gamesPlayed < MIN_PROP_GAMES && !player.blendedWithPrior) return null;
 
   // Pick the player's best market by position, requiring meaningful volume
   // so backups with a handful of yards never rank. Yards markets use the
@@ -561,12 +615,17 @@ function evaluateCandidate(
   player: NflPropCandidate,
   candidate: PropCandidate
 ): PropProjection | null {
+  const statsBasis = player.blendedWithPrior
+    ? `${player.statsSeason} (${player.gamesPlayed} GP) + ${player.statsSeason - 1} (${player.priorGamesPlayed} GP) blended`
+    : `${player.statsSeason} (${player.gamesPlayed} GP)`;
   const reasons: string[] = [
-    `${player.statsSeason} season: ${candidate.playerAvg.toFixed(1)}/game (${player.gamesPlayed} GP)`,
+    `${statsBasis}: ${candidate.playerAvg.toFixed(1)}/game`,
   ];
   if (player.gamesPlayed < THIN_SAMPLE_GAMES) {
     reasons.push(
-      `⚠ Thin sample — only ${player.gamesPlayed} game${player.gamesPlayed === 1 ? "" : "s"} played`,
+      player.blendedWithPrior
+        ? `⚠ Thin sample — ${player.gamesPlayed} game${player.gamesPlayed === 1 ? "" : "s"} this season, blended with ${player.statsSeason - 1}`
+        : `⚠ Thin sample — only ${player.gamesPlayed} game${player.gamesPlayed === 1 ? "" : "s"} played`,
     );
   }
 
@@ -585,21 +644,21 @@ function evaluateCandidate(
     oppVal != null && oppVal > 0 && isShare
       ? oppVal * share
       : oppVal;
-  if (effOpp != null && effOpp > 0) {
-    blended = candidate.playerAvg * 0.6 + effOpp * 0.4;
-    margin = candidate.playerAvg - effOpp;
+  // A zero allowance is missing data, not a shutout defense — one week in,
+  // many defenses show 0.00 TDs allowed, and treating that as real made the
+  // projection lean Over against a "defense" that had conceded nothing.
+  const hasOpp = effOpp != null && effOpp > 0;
+  if (hasOpp) {
+    blended = candidate.playerAvg * 0.6 + effOpp! * 0.4;
+    margin = candidate.playerAvg - effOpp!;
     reasons.push(
       isShare
-        ? `${candidate.oppLabel} ~${oppVal!.toFixed(0)} ${candidate.unit}/g (${candidate.shareLabel} share ~${effOpp.toFixed(candidate.unit === "recs" ? 1 : 0)})`
-        : `${candidate.oppLabel} ~${effOpp.toFixed(candidate.unit === "TDs" ? 2 : 0)} ${candidate.unit}/g`
+        ? `${candidate.oppLabel} ~${oppVal!.toFixed(0)} ${candidate.unit}/g (${candidate.shareLabel} share ~${effOpp!.toFixed(candidate.unit === "recs" ? 1 : 0)})`
+        : `${candidate.oppLabel} ~${effOpp!.toFixed(candidate.unit === "TDs" ? 2 : 0)} ${candidate.unit}/g`
     );
   } else {
     reasons.push(`League baseline ~${candidate.baseline}`);
   }
-
-  // The projected line is the matchup-blended estimate, rounded to a typical
-  // prop increment (0.5).
-  const projectedLine = Math.round(blended * 2) / 2;
 
   // Direction + score: Over when the player out-produces the specific defense
   // (or baseline), scored by how much. Under leans are mild fades ranked below
@@ -613,16 +672,15 @@ function evaluateCandidate(
   const underThreshold = isTd ? -0.4 : isRecs ? -1.5 : -15;
   let direction: "Over" | "Under";
   let score: number;
-  const refVal = effOpp != null ? effOpp : candidate.baseline;
+  const refVal = hasOpp ? effOpp! : candidate.baseline;
   // Share-adjusted labels read better without the verb: "rec DEF WR-share"
   // instead of "rec DEF allows WR-share".
   const defLabel = candidate.oppLabel.replace(/ allows$/, "");
-  const refLabel =
-    effOpp != null
-      ? isShare
-        ? `${defLabel} ${candidate.shareLabel}-share`
-        : candidate.oppLabel
-      : "league baseline";
+  const refLabel = hasOpp
+    ? isShare
+      ? `${defLabel} ${candidate.shareLabel}-share`
+      : candidate.oppLabel
+    : "league baseline";
   if (margin >= overThreshold) {
     direction = "Over";
     reasons.push(`Outpaces ${refLabel} (~${refVal.toFixed(isTd ? 2 : isRecs ? 1 : 0)} ${candidate.unit}/g)`);
@@ -647,6 +705,18 @@ function evaluateCandidate(
   // (A "balanced" state is unreachable here — mid-range margins return null.)
   const matchup: "easy" | "tough" = direction === "Over" ? "easy" : "tough";
 
+  // The projected line is the matchup-blended estimate, rounded to a typical
+  // prop increment (0.5) TOWARD the pick, so the stated direction can never
+  // contradict the projection. Plain rounding produced "Over 1 Receiving TDs"
+  // on a 0.9 projection — the opposite of what the model believes. Small-unit
+  // markets (TDs, receptions) sit near boundaries constantly; yards rarely do.
+  // Stripping a hair also keeps the line strictly inside the projection, so a
+  // line that exactly equals the projection (a coin flip) is never published.
+  const projectedLine =
+    direction === "Over"
+      ? Math.ceil(blended * 2 - 1) / 2
+      : Math.floor(blended * 2 + 1) / 2;
+
   return {
     market: candidate.market,
     playerAvg: candidate.playerAvg,
@@ -654,6 +724,7 @@ function evaluateCandidate(
     projectedLine,
     direction,
     score,
+    statsBasis,
     reasons,
     matchup,
   };
@@ -695,6 +766,7 @@ export function analyzeNflProps(games: NflGame[]): NflPropPick[] {
           matchup: proj.matchup,
           playerAvg: proj.playerAvg,
           statsSeason: player.statsSeason,
+          statsBasis: proj.statsBasis,
           reasons: proj.reasons,
           score: proj.score,
         });

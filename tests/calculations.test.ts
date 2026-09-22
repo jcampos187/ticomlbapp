@@ -28,10 +28,11 @@ import {
 } from "@/lib/analysis";
 import { parseInningsPitched } from "@/lib/mlb";
 import type { Game, ModelEdge, PitcherMetrics } from "@/lib/types";
-import { computeCfbModelEdges, analyzeCfbFavorites } from "@/lib/cfbAnalysis";
-import { computeNflModelEdges, analyzeNflFavorites, analyzeNflProps, buildNflParlays } from "@/lib/nflAnalysis";
-import { selectPropCandidates } from "@/lib/nfl";
-import type { SkillPlayer } from "@/lib/nfl";
+import { computeCfbModelEdges, analyzeCfbFavorites, cfbTeamWinProbability } from "@/lib/cfbAnalysis";
+import { computeOpponentAdjustedMargins, computeMarginsAsOf, SRS_ITERATIONS, SRS_PRIOR_GAMES } from "@/lib/srs";
+import { computeNflModelEdges, analyzeNflFavorites, analyzeNflProps, buildNflParlays, nflTeamWinProbability } from "@/lib/nflAnalysis";
+import { selectPropCandidates, blendPlayerStats, PRIOR_SEASON_WEIGHT_GAMES } from "@/lib/nfl";
+import type { SkillPlayer, PlayerSeasonStats } from "@/lib/nfl";
 import type { CfbGame } from "@/lib/cfbTypes";
 import type { NflGame, NflPropCandidate, NflAtsPick, NflTotalPick } from "@/lib/nflTypes";
 
@@ -813,9 +814,10 @@ describe("backtest mirrors the production model", () => {
 
 /**
  * CFB and NFL model an early-season week with only two inputs — win rate and
- * points per game. Until a team has MIN_EDGE_GAMES (4) games, the win-rate term
- * falls back to 0.5, and because PPG is not opponent-adjusted the whole model
- * collapses to one unbounded scoring term.
+ * scoring margin. Until a team has MIN_EDGE_GAMES (4) games, the win-rate term
+ * falls back to 0.5, and because scoring margin is not opponent-adjusted (a
+ * 40-point win over an FCS tune-up counts the same as one over a contender) the
+ * whole model collapses to one scoring term.
  *
  * That produced, on real slates: `UT Martin +4000 · model 46.7% · edge +44.3pp ·
  * EV +1815%` (CFB week 3) and `Giants +295 · model 82.7% · edge +58.4pp`
@@ -850,9 +852,15 @@ describe("early-season gate (CFB / NFL)", () => {
       awaySpreadOpen: 38.5,
       homeSpreadOpen: -38.5,
       provider: "DraftKings",
-      // The extreme PPG gap that blows the uncapped model up.
+      // The extreme scoring gap that blows the uncapped model up, expressed as
+      // net margin (points scored minus points allowed).
       awayPpg: 47.0,
       homePpg: 21.0,
+      awayPpgAllowed: 21.0,
+      homePpgAllowed: 47.0,
+      // No opponent-adjusted rating yet (the season graph is empty this early).
+      awayAdjMargin: null,
+      homeAdjMargin: null,
       awayConference: null,
       homeConference: null,
       ...overrides,
@@ -883,6 +891,12 @@ describe("early-season gate (CFB / NFL)", () => {
       provider: "DraftKings",
       awayPpg: 30.0,
       homePpg: 18.0,
+      awayPpgAllowed: 24.0,
+      homePpgAllowed: 21.0,
+      // No opponent-adjusted rating yet (the season graph is empty this early),
+      // so the model must fail closed rather than read the raw gap.
+      awayAdjMargin: null,
+      homeAdjMargin: null,
       // The defensive-context and prop-candidate fields are not read by the
       // edge/pick layers under test, so the cast stands in for them here.
       ...overrides,
@@ -901,9 +915,16 @@ describe("early-season gate (CFB / NFL)", () => {
     expect(analyzeNflFavorites(games)).toEqual([]);
   });
 
-  it("starts producing CFB edges again once both records clear the floor", () => {
+  it("starts producing CFB edges again once records AND ratings are available", () => {
     const games = [
-      cfbEarlySeasonGame({ awayRecord: "4-1", homeRecord: "4-1", awayPpg: 34, homePpg: 24 }),
+      cfbEarlySeasonGame({
+        awayRecord: "4-1",
+        homeRecord: "4-1",
+        // Records clear the 4-game floor and the season graph has produced a
+        // rating for both sides, so the layer may disagree with the market.
+        awayAdjMargin: 5,
+        homeAdjMargin: -5,
+      }),
     ];
     // The gate opens, so the layer is free to disagree with the market again.
     expect(computeCfbModelEdges(games).length + analyzeCfbFavorites(games).length).toBeGreaterThan(0);
@@ -1036,6 +1057,8 @@ describe("NFL props and the ATS-only parlay", () => {
       provider: "DraftKings",
       awayPpg: 25,
       homePpg: 23,
+      awayPpgAllowed: 22,
+      homePpgAllowed: 20,
       awayProps: props,
       homeProps: [],
       // Defensive-context fields aren't read by the props layer under test.
@@ -1070,5 +1093,612 @@ describe("NFL props and the ATS-only parlay", () => {
     expect(parlays.length).toBe(1);
     expect(parlays[0].legs.length).toBe(3);
     expect(parlays[0].name).toContain("ATS");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Football model edge: net scoring margin                             */
+/* ------------------------------------------------------------------ */
+
+/** A CFB game with both records above the floor, so the model has signal. */
+function cfbModelGame(overrides: Partial<CfbGame> = {}): CfbGame {
+  return {
+    id: "cfb-model",
+    startTime: "2026-10-10T19:00:00Z",
+    status: "scheduled",
+    awayTeam: "Away",
+    homeTeam: "Home",
+    awayAbbrev: "AWY",
+    homeAbbrev: "HOM",
+    awayRecord: "5-1",
+    homeRecord: "5-1",
+    awayML: -110,
+    homeML: -110,
+    overUnder: 55.5,
+    details: "HOM -1.0",
+    awaySpread: 1,
+    homeSpread: -1,
+    awayMLOpen: -110,
+    homeMLOpen: -110,
+    awaySpreadOpen: 1,
+    homeSpreadOpen: -1,
+    provider: "DraftKings",
+    awayPpg: 28,
+    homePpg: 28,
+    awayPpgAllowed: 28,
+    homePpgAllowed: 28,
+    // Both sides rated league-average by the season graph.
+    awayAdjMargin: 0,
+    homeAdjMargin: 0,
+    awayConference: null,
+    homeConference: null,
+    ...overrides,
+  };
+}
+
+/** An NFL game with both records above the floor. */
+function nflModelGame(overrides: Partial<NflGame> = {}): NflGame {
+  return {
+    ...cfbModelGame(),
+    id: "nfl-model",
+    awayTeam: "Away",
+    homeTeam: "Home",
+    ...overrides,
+  } as unknown as NflGame;
+}
+
+/**
+ * CFB and NFL once modelled a game on win rate plus OFFENSE-only points per
+ * game (blind to defense: 28 scored/14 allowed equalled 28/34), then on raw net
+ * scoring margin (blind to schedule: a blowout of an FCS tune-up counted as much
+ * as a win over a contender). The feature is now the OPPONENT-ADJUSTED margin
+ * from srs.ts, still capped per feature the way MLB caps its inputs.
+ */
+describe("football model: opponent-adjusted scoring margin", () => {
+  it("uses the opponent-adjusted margin — equal records are not equal teams", () => {
+    const even = cfbModelGame(); // both sides rated league-average
+    const homeStrong = cfbModelGame({ homeAdjMargin: 10, awayAdjMargin: -10 });
+    expect(cfbTeamWinProbability(homeStrong, "home")!).toBeGreaterThan(
+      cfbTeamWinProbability(even, "home")!,
+    );
+  });
+
+  it("works for the NFL too", () => {
+    const even = nflModelGame();
+    const homeStrong = nflModelGame({ homeAdjMargin: 8, awayAdjMargin: -8 });
+    expect(nflTeamWinProbability(homeStrong, "home")!).toBeGreaterThan(
+      nflTeamWinProbability(even, "home")!,
+    );
+  });
+
+  it("ignores raw scoring entirely — a padded margin buys nothing", () => {
+    // Identical adjusted ratings, but one side has gaudy raw scoring numbers.
+    // If the model still read raw margin, this would move the probability.
+    const plain = cfbModelGame();
+    const padded = cfbModelGame({
+      awayPpg: 55,
+      awayPpgAllowed: 3,
+      homePpg: 10,
+      homePpgAllowed: 45,
+    });
+    expect(cfbTeamWinProbability(padded, "home")).toBeCloseTo(
+      cfbTeamWinProbability(plain, "home")!,
+      10,
+    );
+  });
+
+  it("caps the CFB margin feature so one stat can't run away with the logit", () => {
+    // 0.15 × 20 points already exceeds the 2.0 cap, so a 20-point adjusted
+    // margin gap and a 42-point one must land on the SAME probability…
+    const moderate = cfbModelGame({ homeAdjMargin: 10, awayAdjMargin: -10 });
+    const extreme = cfbModelGame({ homeAdjMargin: 21, awayAdjMargin: -21 });
+    expect(cfbTeamWinProbability(extreme, "home")).toBeCloseTo(
+      cfbTeamWinProbability(moderate, "home")!,
+      10,
+    );
+    // …while smaller gaps still move the model, so the cap isn't just flat.
+    const small = cfbModelGame({ homeAdjMargin: 4, awayAdjMargin: -4 });
+    expect(cfbTeamWinProbability(small, "home")!).toBeLessThan(
+      cfbTeamWinProbability(moderate, "home")!,
+    );
+  });
+
+  it("caps the NFL margin feature the same way", () => {
+    // 0.13 × 10 points exceeds the 0.6 cap.
+    const moderate = nflModelGame({ homeAdjMargin: 5, awayAdjMargin: -5 });
+    const extreme = nflModelGame({ homeAdjMargin: 21, awayAdjMargin: -21 });
+    expect(nflTeamWinProbability(extreme, "home")).toBeCloseTo(
+      nflTeamWinProbability(moderate, "home")!,
+      10,
+    );
+    const small = nflModelGame({ homeAdjMargin: 1, awayAdjMargin: -1 });
+    expect(nflTeamWinProbability(small, "home")!).toBeLessThan(
+      nflTeamWinProbability(moderate, "home")!,
+    );
+  });
+
+  it("treats a missing rating as league-average, never as the raw margin", () => {
+    // Raw scoring says the home side is a 42-point monster; with no rating both
+    // sides are average, so only home field remains.
+    const unknown = cfbModelGame({
+      awayAdjMargin: null,
+      homeAdjMargin: null,
+      homePpg: 45,
+      homePpgAllowed: 3,
+    });
+    const home = cfbTeamWinProbability(unknown, "home")!;
+    expect(home).toBeGreaterThan(50);
+    expect(home).toBeLessThan(60);
+  });
+
+  it("fails closed when no opponent-adjusted rating is available", () => {
+    // A raw margin — even a huge one — is no longer model signal, so the layer
+    // emits nothing rather than guessing off a schedule-blind average.
+    const noRating = cfbModelGame({ awayAdjMargin: null, homeAdjMargin: null });
+    expect(computeCfbModelEdges([noRating])).toEqual([]);
+    expect(computeNflModelEdges([nflModelGame({ awayAdjMargin: null, homeAdjMargin: null })])).toEqual([]);
+  });
+});
+
+/**
+ * The opponent adjustment itself. A raw margin is not comparable across
+ * schedules: a 30-point win over a weak team looks like a contender's result
+ * until it is measured against what those opponents did to everyone else. These
+ * tests pin the two properties the model depends on — beating up on weak
+ * opponents is discounted, and the ratings stay centred on zero.
+ */
+describe("opponent-adjusted margin (SRS)", () => {
+  it("discounts a big margin piled up against weak opponents", () => {
+    // Strong plays only cupcakes and wins huge; Cupcake loses to everyone.
+    // Weak beats Nobody, and Nobody beats Cupcake, so Cupcake's rating is low.
+    const games = [
+      { homeTeamId: 1, awayTeamId: 4, homeScore: 50, awayScore: 7 }, // Strong over Cupcake
+      { homeTeamId: 1, awayTeamId: 5, homeScore: 45, awayScore: 10 }, // Strong over Nobody
+      { homeTeamId: 5, awayTeamId: 4, homeScore: 21, awayScore: 0 }, // Nobody over Cupcake
+    ];
+    const r = computeOpponentAdjustedMargins(games);
+    // Raw margin for team 1 is (43 + 35) / 2 = 39, but its opponents are weak
+    // (both lost badly to it), so the adjusted rating is well below that.
+    expect(r.get(1)!).toBeLessThan(39);
+    // Cupcake, beaten by both, is the worst team.
+    expect(r.get(4)!).toBeLessThan(r.get(5)!);
+    expect(r.get(5)!).toBeLessThan(r.get(1)!);
+  });
+
+  it("rewards a margin earned against strong opponents", () => {
+    // Same two wins by 7 for A and B…
+    const evenSchedule = [
+      { homeTeamId: 1, awayTeamId: 2, homeScore: 24, awayScore: 17 },
+      { homeTeamId: 3, awayTeamId: 4, homeScore: 24, awayScore: 17 },
+    ];
+    // …but A's opponent is a good team (it beat a good side), while B's is not.
+    const withContext = [
+      { homeTeamId: 1, awayTeamId: 2, homeScore: 24, awayScore: 17 },
+      { homeTeamId: 2, awayTeamId: 3, homeScore: 30, awayScore: 3 }, // B is good
+      { homeTeamId: 3, awayTeamId: 4, homeScore: 24, awayScore: 17 },
+    ];
+    const flat = computeOpponentAdjustedMargins(evenSchedule);
+    const adjusted = computeOpponentAdjustedMargins(withContext);
+    // Beating a team that itself wins big is worth more than beating a loser.
+    expect(adjusted.get(1)!).toBeGreaterThan(flat.get(1)!);
+  });
+
+  it("centres the ratings on zero", () => {
+    const games = [
+      { homeTeamId: 1, awayTeamId: 2, homeScore: 30, awayScore: 10 },
+      { homeTeamId: 2, awayTeamId: 3, homeScore: 21, awayScore: 14 },
+      { homeTeamId: 3, awayTeamId: 1, homeScore: 17, awayScore: 17 },
+    ];
+    const r = computeOpponentAdjustedMargins(games);
+    const mean = [...r.values()].reduce((a, b) => a + b, 0) / r.size;
+    expect(Math.abs(mean)).toBeLessThan(1e-9);
+    for (const v of r.values()) expect(Number.isFinite(v)).toBe(true);
+  });
+
+  it("returns an empty map (not NaN) when there are no games", () => {
+    expect(computeOpponentAdjustedMargins([]).size).toBe(0);
+    // A malformed row is skipped rather than poisoning every rating.
+    const r = computeOpponentAdjustedMargins([
+      { homeTeamId: 1, awayTeamId: 2, homeScore: Number.NaN, awayScore: 10 },
+      { homeTeamId: 1, awayTeamId: 2, homeScore: 20, awayScore: 10 },
+    ]);
+    for (const v of r.values()) expectFinite(v);
+  });
+
+  it("shrinks a small sample toward league average instead of letting it run", () => {
+    // Team 1 beat team 2 by 63 and team 3 by 7; team 3 beat team 2 by 4. Every
+    // team has barely played, and one result is a 63-point blowout.
+    const games = [
+      { homeTeamId: 1, awayTeamId: 2, homeScore: 66, awayScore: 3 },
+      { homeTeamId: 3, awayTeamId: 2, homeScore: 24, awayScore: 20 },
+      { homeTeamId: 1, awayTeamId: 3, homeScore: 27, awayScore: 20 },
+    ];
+    const r = computeOpponentAdjustedMargins(games);
+    // Without the prior these run to ~±23 off the 63-point margin; CFB is full
+    // of one-game teams (FCS schools) and those extremes distorted the centred
+    // zero point enough to rate a 4-0 team near +54 and print a 40pp edge.
+    for (const v of r.values()) {
+      expect(Math.abs(v)).toBeLessThan(10);
+      expectFinite(v);
+    }
+    // Shrinkage must not flatten the ordering: team 1 beat team 3 head to head.
+    expect(r.get(1)!).toBeGreaterThan(r.get(3)!);
+    expect(r.get(1)!).toBeGreaterThan(0);
+  });
+
+  it("keeps a well-sampled rating closer to its raw value than a thin one", () => {
+    // Build a connected league so games-played actually differs.
+    const games: { homeTeamId: number; awayTeamId: number; homeScore: number; awayScore: number }[] = [];
+    for (let i = 0; i < 12; i++) {
+      games.push({ homeTeamId: 1, awayTeamId: 100 + i, homeScore: 30, awayScore: 10 });
+    }
+    // Team 1 has 12 games; each opponent has exactly 1.
+    const r = computeOpponentAdjustedMargins(games);
+    const rawTeam1 = 20;
+    const keep = 12 / (12 + SRS_PRIOR_GAMES);
+    const thinKeep = 1 / (1 + SRS_PRIOR_GAMES);
+    // The well-sampled team retains far more of its rating than a one-game team.
+    expect(keep).toBeGreaterThan(thinKeep);
+    expect(Math.abs(r.get(1)!)).toBeLessThanOrEqual(rawTeam1 / keep + 1e-9);
+  });
+});
+
+/**
+ * Look-ahead is the one bug this module cannot be allowed to have: a rating that
+ * saw its own game (or a same-day game) makes the backtest's accuracy a fiction.
+ * The old football fit did exactly that by reading full-season team stats.
+ */
+describe("point-in-time integrity", () => {
+  const games = [
+    { date: "2026-09-01", homeTeamId: 1, awayTeamId: 2, homeScore: 40, awayScore: 3 },
+    { date: "2026-09-08", homeTeamId: 2, awayTeamId: 3, homeScore: 21, awayScore: 20 },
+  ];
+
+  it("excludes a game played on the SAME date as the cut-off", () => {
+    // As of 09-08 only the 09-01 game is knowable, so team 3 is not rated yet.
+    const asOf = computeMarginsAsOf(games, "2026-09-08");
+    expect(asOf.has(1)).toBe(true);
+    expect(asOf.has(2)).toBe(true);
+    expect(asOf.has(3)).toBe(false);
+  });
+
+  it("includes a game once its date has passed", () => {
+    const later = computeMarginsAsOf(games, "2026-09-09");
+    expect(later.has(3)).toBe(true);
+  });
+
+  it("rates nothing before the season's first game", () => {
+    expect(computeMarginsAsOf(games, "2026-09-01").size).toBe(0);
+  });
+});
+
+/**
+ * The backtest fits the Platt parameters the app applies, so its copy of each
+ * sport's model has to be the production model. It is a standalone .mjs script
+ * that cannot import the TypeScript it mirrors, so these source-level checks on
+ * the shared constants are the contract between them — the same drift the MLB
+ * coefficients are guarded against.
+ */
+describe("backtest mirrors the football models", () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const cfbProduction = readFileSync(path.join(projectRoot, "src/lib/cfbAnalysis.ts"), "utf8");
+  const nflProduction = readFileSync(path.join(projectRoot, "src/lib/nflAnalysis.ts"), "utf8");
+  const backtest = readFileSync(path.join(projectRoot, "scripts/backtest-model.mjs"), "utf8");
+
+  /** Read `[export ]const NAME = <number>` from a source file. */
+  function num(source: string, name: string): number {
+    const m = new RegExp(`\\b${name}\\s*=\\s*(-?[\\d.]+)`).exec(source);
+    expect(m, `${name} not found`).not.toBeNull();
+    return Number(m![1]);
+  }
+
+  /** The `cfb: { … }` / `nfl: { … }` block of FOOTBALL_CONFIG. */
+  function configBlock(sport: "cfb" | "nfl"): string {
+    const start = backtest.indexOf(`\n  ${sport}: {`);
+    expect(start, `${sport} config block not found`).toBeGreaterThan(-1);
+    const end = backtest.indexOf("\n  },", start);
+    expect(end, `${sport} config block is unterminated`).toBeGreaterThan(start);
+    return backtest.slice(start, end);
+  }
+
+  function cfg(sport: "cfb" | "nfl", key: string): number {
+    const m = new RegExp(`\\b${key}:\\s*(-?[\\d.]+)`).exec(configBlock(sport));
+    expect(m, `${sport}.${key} not found`).not.toBeNull();
+    return Number(m![1]);
+  }
+
+  /** A nested `key: <number>` inside a named object literal (production side). */
+  function prodNested(source: string, constName: string, key: string): number {
+    const block = new RegExp(`const ${constName} = \\{[\\s\\S]*?\\n\\};`).exec(source);
+    expect(block, `${constName} not found`).not.toBeNull();
+    const v = new RegExp(`\\b${key}:\\s*(-?[\\d.]+)`).exec(block![0]);
+    expect(v, `${constName}.${key} not found`).not.toBeNull();
+    return Number(v![1]);
+  }
+
+  /** A nested `key: <number>` in the same shape inside a config block (backtest side). */
+  function cfgNested(sport: "cfb" | "nfl", objName: string, key: string): number {
+    const obj = new RegExp(`${objName}:\\s*\\{[^}]*\\}`).exec(configBlock(sport));
+    expect(obj, `${sport}.${objName} not found`).not.toBeNull();
+    const v = new RegExp(`\\b${key}:\\s*(-?[\\d.]+)`).exec(obj![0]);
+    expect(v, `${sport}.${objName}.${key} not found`).not.toBeNull();
+    return Number(v![1]);
+  }
+
+  const cases = [
+    { sport: "cfb" as const, production: cfbProduction, prefix: "CFB", leagueAvg: "CFB_LEAGUE_AVG" },
+    { sport: "nfl" as const, production: nflProduction, prefix: "NFL", leagueAvg: "NFL_LEAGUE_AVG" },
+  ];
+
+  it("shares the margin coefficient, win-rate coefficient and home edge", () => {
+    for (const { sport, production, prefix } of cases) {
+      for (const [prodName, cfgKey] of [
+        [`${prefix}_COEF_MARGIN`, "coefMargin"],
+        [`${prefix}_COEF_WIN_RATE`, "coefWinRate"],
+        [`${prefix}_HOME_ADV`, "homeAdv"],
+      ] as const) {
+        const m = new RegExp(`\\b${prodName}\\s*=\\s*(-?[\\d.]+)`).exec(production);
+        expect(m, `${prodName} not found`).not.toBeNull();
+        expect(Number(m![1]), `${prodName} drifted from ${sport}.${cfgKey}`).toBe(cfg(sport, cfgKey));
+      }
+    }
+  });
+
+  it("shares the per-feature caps and the league-average margin", () => {
+    for (const { sport, production, leagueAvg } of cases) {
+      expect(prodNested(production, "MAX_FEATURE_LOGIT", "winRate"))
+        .toBe(cfgNested(sport, "maxFeatureLogit", "winRate"));
+      expect(prodNested(production, "MAX_FEATURE_LOGIT", "margin"))
+        .toBe(cfgNested(sport, "maxFeatureLogit", "margin"));
+      // Both sides must agree that an unknown team is exactly average (0),
+      // not "a team that has allowed no points".
+      expect(prodNested(production, leagueAvg, "margin")).toBe(cfgNested(sport, "leagueAvg", "margin"));
+      expect(prodNested(production, leagueAvg, "margin")).toBe(0);
+    }
+  });
+
+  it("shares the opponent-adjustment iteration count", () => {
+    // The backtest mirrors computeOpponentAdjustedMargins because it is a
+    // standalone .mjs script that cannot import the TypeScript. If the two
+    // loops disagree on how many passes they run, they stop computing the same
+    // rating — and the fit silently describes a model the app no longer has.
+    expect(num(backtest, "SRS_ITERATIONS")).toBe(SRS_ITERATIONS);
+  });
+
+  it("shares the opponent-adjustment sample-size prior", () => {
+    // Shrinkage changes every rating, so a mismatch would mean the fit was
+    // computed for a different feature than the app runs.
+    expect(num(backtest, "SRS_PRIOR_GAMES")).toBe(SRS_PRIOR_GAMES);
+  });
+
+  it("cannot look ahead — a rating is built strictly from earlier games", () => {
+    // The old football fit read each team's FULL-SEASON scoring stats to
+    // "predict" mid-season games; that look-ahead is why its Brier looked far
+    // better than the model really was. Both halves of the contract are pinned:
+    // a strict date filter, and no full-season stat source at all.
+    expect(backtest).toContain("g.date < date");
+    expect(backtest).not.toContain("g.date <= date");
+    expect(backtest).not.toContain("fetchFootballTeamStats");
+  });
+
+  it("ships calibrations stamped with the feature set the backtest fits", () => {
+    for (const [sport, file] of [
+      ["cfb", "calibration-cfb.json"],
+      ["nfl", "calibration-nfl.json"],
+    ] as const) {
+      const cal = JSON.parse(readFileSync(path.join(projectRoot, "src/lib", file), "utf8"));
+      expect(cal.featureSet, `${file} is stale — re-run the backtest`).toBe(cfg(sport, "featureSet"));
+      expect(Number.isFinite(cal.plattScaling.A)).toBe(true);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* NFL props: prior-season blend and line/direction agreement          */
+/* ------------------------------------------------------------------ */
+
+const seasonStats = (over: Partial<PlayerSeasonStats>): PlayerSeasonStats => ({
+  gamesPlayed: 0,
+  passingYardsPerGame: null,
+  passingTds: null,
+  rushingYardsPerGame: null,
+  rushingTds: null,
+  receivingYardsPerGame: null,
+  receivingTds: null,
+  receptions: null,
+  receptionsPerGame: null,
+  ...over,
+});
+
+/** An NFL game carrying one team's prop candidates. */
+function nflPropGame(awayProps: NflPropCandidate[]): NflGame {
+  return {
+    id: "prop-game",
+    startTime: "2026-10-04T17:00:00Z",
+    status: "scheduled",
+    awayTeam: "Away",
+    homeTeam: "Home",
+    awayAbbrev: "AAA",
+    homeAbbrev: "HHH",
+    awayRecord: "4-1",
+    homeRecord: "4-1",
+    awayML: -120,
+    homeML: 100,
+    overUnder: 45.5,
+    details: "AAA -1.5",
+    awaySpread: -1.5,
+    homeSpread: 1.5,
+    awayMLOpen: -120,
+    homeMLOpen: 100,
+    awaySpreadOpen: -1.5,
+    homeSpreadOpen: 1.5,
+    provider: "DraftKings",
+    awayPpg: 25,
+    homePpg: 23,
+    awayPpgAllowed: 22,
+    homePpgAllowed: 20,
+    awayProps,
+    homeProps: [],
+  } as unknown as NflGame;
+}
+
+const propCandidate = (over: Partial<NflPropCandidate>): NflPropCandidate => ({
+  playerId: 1,
+  name: "Bell Cow",
+  position: "RB",
+  teamAbbrev: "AAA",
+  statsSeason: 2026,
+  gamesPlayed: 4,
+  passingYardsPerGame: null,
+  passingTdsPerGame: null,
+  rushingYardsPerGame: null,
+  rushingTdsPerGame: null,
+  receivingYardsPerGame: null,
+  receivingTdsPerGame: null,
+  receptionsPerGame: null,
+  ...over,
+});
+
+describe("NFL props: prior-season blend", () => {
+  it("weights the prior season as PRIOR_SEASON_WEIGHT_GAMES games", () => {
+    const current = seasonStats({ gamesPlayed: 1, rushingYardsPerGame: 100, rushingTds: 2 });
+    const prior = seasonStats({ gamesPlayed: 17, rushingYardsPerGame: 60, rushingTds: 1 });
+    const { stats, blended } = blendPlayerStats(current, prior);
+    expect(blended).toBe(true);
+    const w = 1 + PRIOR_SEASON_WEIGHT_GAMES;
+    expect(stats.rushingYardsPerGame).toBeCloseTo((100 + 60 * PRIOR_SEASON_WEIGHT_GAMES) / w, 10);
+    expect(stats.rushingTds).toBeCloseTo((2 + 1 * PRIOR_SEASON_WEIGHT_GAMES) / w, 10);
+    // The CURRENT game count survives, so the thin-sample warning still fires.
+    expect(stats.gamesPlayed).toBe(1);
+  });
+
+  it("ignores a prior season too short to be a prior", () => {
+    const current = seasonStats({ gamesPlayed: 1, rushingYardsPerGame: 100 });
+    const cameo = seasonStats({ gamesPlayed: 3, rushingYardsPerGame: 5 });
+    const { stats, blended } = blendPlayerStats(current, cameo);
+    expect(blended).toBe(false);
+    expect(stats).toEqual(current);
+    expect(blendPlayerStats(current, null).blended).toBe(false);
+  });
+
+  it("does not blend when there is no current sample to stabilise", () => {
+    const none = seasonStats({ gamesPlayed: 0, rushingYardsPerGame: null });
+    const prior = seasonStats({ gamesPlayed: 17, rushingYardsPerGame: 60 });
+    expect(blendPlayerStats(none, prior).blended).toBe(false);
+  });
+
+  it("supplies a market the current season has no data for", () => {
+    const current = seasonStats({ gamesPlayed: 1, receivingYardsPerGame: null });
+    const prior = seasonStats({ gamesPlayed: 16, receivingYardsPerGame: 70 });
+    expect(blendPlayerStats(current, prior).stats.receivingYardsPerGame).toBe(70);
+  });
+
+  it("projects from a blended one-game sample, and records where it came from", () => {
+    const props = analyzeNflProps([
+      nflPropGame([
+        propCandidate({
+          gamesPlayed: 1,
+          rushingYardsPerGame: 82,
+          rushingTdsPerGame: 0.9,
+          blendedWithPrior: true,
+          priorGamesPlayed: 17,
+        }),
+      ]),
+    ]);
+    expect(props.length).toBeGreaterThan(0);
+    // Provenance travels with the pick, so a tracked row still shows how thin
+    // its sample was after the fact.
+    expect(props[0].statsBasis).toContain("2025");
+    expect(props[0].statsBasis).toContain("blended");
+  });
+
+  it("stays dark for that same player when the blend flag is the only thing missing", () => {
+    // Proves the floor can't be bypassed by simply having played one game — the
+    // gate opens only for a sample the model actually blended.
+    const props = analyzeNflProps([
+      nflPropGame([
+        propCandidate({ gamesPlayed: 1, rushingYardsPerGame: 82, rushingTdsPerGame: 0.9 }),
+      ]),
+    ]);
+    expect(props).toEqual([]);
+  });
+});
+
+describe("prop lines agree with their direction", () => {
+  it("never publishes an Over line at or above the projection it came from", () => {
+    // Plain rounding to the nearest half produced "Over 1" on a 0.9/game
+    // projection — a line above the number the model actually believes.
+    let checked = 0;
+    let subOneOver = 0;
+    for (const tds of [0.3, 0.5, 0.7, 0.9, 1.1, 1.2, 1.6, 2.5, 3.4]) {
+      const props = analyzeNflProps([
+        nflPropGame([propCandidate({ gamesPlayed: 4, rushingTdsPerGame: tds })]),
+      ]);
+      for (const p of props) {
+        if (p.playerAvg == null) continue;
+        checked++;
+        if (p.direction === "Over") expect(p.projectedLine).toBeLessThan(p.playerAvg);
+        else expect(p.projectedLine).toBeGreaterThan(p.playerAvg);
+        // The case that used to break: a sub-1.0 average rounding UP to a
+        // whole-number line while still being called an Over.
+        if (p.direction === "Over" && p.playerAvg < 1) subOneOver++;
+      }
+    }
+    // Guard against a vacuous pass: this loop must actually produce props, and
+    // specifically the sub-1.0 TD markets where the old rounding inverted.
+    expect(checked).toBeGreaterThan(0);
+    expect(subOneOver).toBeGreaterThan(0);
+  });
+
+  it("falls back to the league baseline instead of quoting a 0.00 defense", () => {
+    // With no defensive allowance there is nothing to compare against, so the
+    // reasons must say so rather than printing "~0.00 TDs/g allowed".
+    const props = analyzeNflProps([
+      nflPropGame([propCandidate({ gamesPlayed: 4, rushingTdsPerGame: 1.2 })]),
+    ]);
+    expect(props.length).toBeGreaterThan(0);
+    expect(props[0].reasons.join(" ")).toContain("league baseline");
+    expect(props[0].reasons.join(" ")).not.toContain("~0.00");
+  });
+});
+
+/**
+ * The tracker captures picks from the API and grades them later, so a market
+ * the app can emit but the grader cannot resolve becomes a row that sits
+ * pending forever. NFL props never graded at all (category "Prop" had no
+ * parser), and now that props are emitted every week a new market must not
+ * silently join them.
+ */
+describe("tracker scripts cover every market the app emits", () => {
+  const projectRoot = fileURLToPath(new URL("..", import.meta.url));
+  const grader = readFileSync(path.join(projectRoot, "scripts/grade-picks.mjs"), "utf8");
+  const capture = readFileSync(path.join(projectRoot, "scripts/capture-picks.mjs"), "utf8");
+  const nflProduction = readFileSync(path.join(projectRoot, "src/lib/nflAnalysis.ts"), "utf8");
+
+  it("can grade every NFL prop market the model emits", () => {
+    const markets = new Set(
+      [...nflProduction.matchAll(/market: "([^"]+)"/g)].map((m) => m[1]),
+    );
+    expect(markets.size).toBeGreaterThan(0);
+    for (const market of markets) {
+      expect(grader, `"${market}" has no box-score mapping in grade-picks.mjs`)
+        .toContain(`"${market}"`);
+    }
+  });
+
+  it("parses the prop line format the capture script writes", () => {
+    // capture-picks writes `${player} ${direction} ${line} ${market} (${team})`;
+    // grade-picks must recognise that exact shape.
+    expect(capture).toContain(
+      "${p.player} ${p.direction} ${p.projectedLine} ${p.market} (${p.team})",
+    );
+    expect(grader).toContain('category === "Prop"');
+  });
+
+  it("persists the model metrics it calculates", () => {
+    // These were computed per row and then dropped by a hardcoded field list,
+    // leaving every tracked pick unusable for edge/EV analysis.
+    expect(capture).toContain("...metrics,");
+    expect(capture).toContain("const { id, date, sport: rowSport, category, pick, ...metrics } = row;");
   });
 });

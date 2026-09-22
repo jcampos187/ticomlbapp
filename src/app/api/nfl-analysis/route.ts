@@ -7,11 +7,14 @@ import {
   fetchNflTeamLeaders,
   fetchNflPlayerStats,
   fetchNflTeamStats,
+  fetchNflSeasonResults,
+  blendPlayerStats,
   selectPropCandidates,
   nflWeekLabel,
 } from "@/lib/nfl";
+import { computeOpponentAdjustedMargins } from "@/lib/srs";
 import { mapWithConcurrency } from "@/lib/concurrency";
-import { analyzeNflFavorites, analyzeNflAts, analyzeNflTotals, analyzeNflProps, buildNflParlays, computeNflModelEdges } from "@/lib/nflAnalysis";
+import { analyzeNflFavorites, analyzeNflAts, analyzeNflTotals, analyzeNflProps, buildNflParlays, computeNflModelEdges, MIN_PROP_GAMES } from "@/lib/nflAnalysis";
 import type { NflGame, NflPropCandidate, NflAnalysisResult } from "@/lib/nflTypes";
 
 // The slate is resolved from ESPN at request time, so the route must never be
@@ -97,24 +100,45 @@ export async function GET() {
       if (statTargets.length >= MAX_PLAYER_STATS) break;
     }
 
-    // 7. Season stats for the selected candidates only.
+    // 7. Season stats for the selected candidates only. A player short of the
+    //    prop floor (everyone in weeks 1-2) also gets the prior season fetched
+    //    so the projection can lean on last year's per-game rates instead of
+    //    the section going dark for a month — see blendPlayerStats. This only
+    //    costs extra requests while samples are thin.
     const statsResults = await mapWithConcurrency(
       statTargets,
       ESPN_CONCURRENCY,
-      async ({ teamId, player }) => ({
-        teamId,
-        player,
-        stats: await fetchNflPlayerStats(player.playerId, statsSeason, 2),
-      }),
+      async ({ teamId, player }) => {
+        const current = await fetchNflPlayerStats(player.playerId, statsSeason, 2);
+        if (!current || current.gamesPlayed >= MIN_PROP_GAMES) {
+          return { teamId, player, stats: current, priorGamesPlayed: 0, blended: false };
+        }
+        const prior = await fetchNflPlayerStats(player.playerId, statsSeason - 1, 2);
+        const { stats, blended } = blendPlayerStats(current, prior);
+        return {
+          teamId,
+          player,
+          stats,
+          priorGamesPlayed: prior?.gamesPlayed ?? 0,
+          blended,
+        };
+      },
     );
 
-    // 8. Fetch team season stats for scoring context (points per game).
-    const teamStatsResults = await mapWithConcurrency(
-      teamIds,
-      ESPN_CONCURRENCY,
-      async id => ({ id, stats: await fetchNflTeamStats(id, statsSeason, 2) }),
-    );
+    // 8. Fetch team season stats for scoring context (points per game), and the
+    //    season's completed games for the opponent-adjusted margin. Raw net
+    //    margin is not comparable across schedules, so the model needs an
+    //    SRS-style rating; past days are cached, so the sweep is paid once warm.
+    const [teamStatsResults, seasonGames] = await Promise.all([
+      mapWithConcurrency(
+        teamIds,
+        ESPN_CONCURRENCY,
+        async id => ({ id, stats: await fetchNflTeamStats(id, statsSeason, 2) }),
+      ),
+      fetchNflSeasonResults(ctx.seasonYear),
+    ]);
     const teamStatsMap = new Map(teamStatsResults.map(r => [r.id, r.stats]));
+    const adjMargins = computeOpponentAdjustedMargins(seasonGames);
 
     // 9. Assemble NflGame objects.
     const games: NflGame[] = [];
@@ -135,9 +159,10 @@ export async function GET() {
         return statTargets
           .filter(t => t.teamId === teamId)
           .map(({ player }) => {
-            const stat = statsResults.find(
+            const result = statsResults.find(
               r => r.player.playerId === player.playerId && r.teamId === teamId
-            )?.stats;
+            );
+            const stat = result?.stats;
             return {
               playerId: player.playerId,
               name: player.name,
@@ -145,6 +170,8 @@ export async function GET() {
               teamAbbrev: abbrev,
               statsSeason,
               gamesPlayed: stat?.gamesPlayed ?? 0,
+              blendedWithPrior: result?.blended ?? false,
+              priorGamesPlayed: result?.priorGamesPlayed || undefined,
               passingYardsPerGame: stat?.passingYardsPerGame ?? null,
               passingTdsPerGame: stat?.passingTds ?? null,
               rushingYardsPerGame: stat?.rushingYardsPerGame ?? null,
@@ -179,6 +206,10 @@ export async function GET() {
         provider: odds.provider,
         awayPpg: awayStats?.pointsPerGame ?? null,
         homePpg: homeStats?.pointsPerGame ?? null,
+        awayPpgAllowed: awayStats?.pointsAllowedPerGame ?? null,
+        homePpgAllowed: homeStats?.pointsAllowedPerGame ?? null,
+        awayAdjMargin: adjMargins.get(game.awayTeamId) ?? null,
+        homeAdjMargin: adjMargins.get(game.homeTeamId) ?? null,
         awayDefPassYds: awayStats?.passYdsAllowedPerGame ?? null,
         awayDefRushYds: awayStats?.rushYdsAllowedPerGame ?? null,
         awayDefPassTds: awayStats?.passTdsAllowedPerGame ?? null,

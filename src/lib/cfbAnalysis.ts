@@ -1,5 +1,5 @@
 import type { CfbGame, CfbTopPick, CfbAtsPick, CfbTotalPick, CfbParlay, CfbModelEdge } from "./cfbTypes";
-import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability } from "./analysis";
+import { formatOdds, calculateParlayPayout, sigmoid, fairMarketProbability, expectedValue, edgeConfidence, marketProbability, clampFeature } from "./analysis";
 import calibration from "./calibration-cfb.json";
 
 // ── Model Edge: logistic win-probability model vs market implied ────
@@ -8,7 +8,11 @@ import calibration from "./calibration-cfb.json";
 // OFF in CFB — games without an ML simply produce no edge.
 const CFB_LEAGUE_AVG = {
   winRate: 0.5,
-  ppg: 28.0,
+  // League-average NET scoring margin is zero by construction: every point a
+  // team scores is a point somebody allowed. A missing team is therefore
+  // assumed to be exactly average, rather than handed a plausible-looking PPG
+  // the model would then treat as real offense.
+  margin: 0,
 };
 
 // A record must represent at least this many games before win rate counts as
@@ -21,11 +25,46 @@ const MIN_EDGE_GAMES = 4;
 // logits (a 10-pt CFB favorite ≈ 85% win prob, a 21-pt favorite ≈ 96%).
 const CFB_HOME_ADV = 0.42;
 const CFB_COEF_WIN_RATE = 3.2;
-const CFB_COEF_PPG = 0.16;
+/**
+ * Logits per point of OPPONENT-ADJUSTED net scoring margin difference.
+ *
+ * This replaces the old offense-only PPG term, and then the raw net-margin
+ * term that followed it. PPG difference is only half of expected margin (28
+ * scored/14 allowed looked identical to 28/34), and raw margin is not
+ * comparable across schedules — a 30-point win over an FCS tune-up counted the
+ * same as one over a contender. The margin feature is now the SRS-style rating
+ * from srs.ts, so a point is a point of margin *against the schedule actually
+ * played*.
+ *
+ * The rating is centred on zero, so a missing team is still exactly average
+ * (CFB_LEAGUE_AVG.margin = 0) and the per-point weight stays in the range the
+ * PPG coefficient used. Blowout margins are the thing this term exists to
+ * deflate, and MAX_FEATURE_LOGIT.margin still bounds what one stat can
+ * contribute.
+ */
+const CFB_COEF_MARGIN = 0.15;
+
+/** Per-feature logit caps, mirroring MAX_FEATURE_LOGIT in analysis.ts (MLB): a
+ *  single extreme stat can't dominate the model and print a huge fake edge. */
+const MAX_FEATURE_LOGIT = {
+  winRate: 0.6,
+  // Chosen by measurement, not taste. On the 2025 season (point-in-time, 526
+  // games) the opponent-adjusted margin term scored Brier 0.1899 at 0.8,
+  // 0.1871 at 1.1, 0.1855 at 2.0 and 0.1853 at 3.0 — against 0.2122 for the raw
+  // margin feature it replaced. The gain flattens from ~1.8 up (within 0.0003),
+  // so 2.0 holds the "one stat can't dominate" bound at essentially no cost.
+  // Most of the bounding is done upstream anyway, by the sample-size shrinkage
+  // in srs.ts (SRS_PRIOR_GAMES), which is why the optimum moved up once that
+  // landed.
+  margin: 2.0,
+};
 
 interface CfbModelInputs {
   winRate: number;
-  ppg: number;
+  /** Opponent-adjusted net scoring margin (points per game, centred on 0). */
+  margin: number;
+  /** True when `margin` is the opponent-adjusted rating rather than raw margin. */
+  adjusted: boolean;
   complete: boolean;
 }
 
@@ -34,12 +73,27 @@ function cfbInputs(game: CfbGame, side: "away" | "home"): CfbModelInputs {
   const [w, l] = winRateRaw.split("-").map(Number);
   const games = Number.isFinite(w) && Number.isFinite(l) ? w + l : 0;
   const winRate = games >= MIN_EDGE_GAMES ? w / games : null;
-  const ppg = side === "away" ? game.awayPpg : game.homePpg;
+
+  // The margin input is the OPPONENT-ADJUSTED rating (SRS-style, see srs.ts),
+  // not the raw scored-minus-allowed average. An unadjusted average is compared
+  // against a sharp price for an opponent the team never played, so its sign
+  // can be wrong however tightly it is capped. Raw margin is not used by the
+  // model at all — the gate below requires a real rating.
+  const adj = side === "away" ? game.awayAdjMargin : game.homeAdjMargin;
+
   return {
     winRate: winRate ?? CFB_LEAGUE_AVG.winRate,
-    ppg: ppg ?? CFB_LEAGUE_AVG.ppg,
-    // Strong data = both sides have record (4+ games) + PPG (4 of 4 inputs).
-    complete: winRate != null && ppg != null,
+    // A missing rating falls back to LEAGUE AVERAGE, never to the raw margin.
+    // Substituting raw margin here would quietly restore the schedule-blind
+    // feature this change removes, for exactly the teams whose schedule we
+    // failed to read.
+    margin: adj ?? CFB_LEAGUE_AVG.margin,
+    adjusted: adj != null,
+    // Strong data = a real record (4+ games) AND an opponent-adjusted margin.
+    // A raw margin does NOT count: without the adjustment the model compares a
+    // schedule-blind average against the market, which is the exact failure the
+    // adjustment exists to remove. Fail closed rather than guess.
+    complete: winRate != null && adj != null,
   };
 }
 
@@ -75,8 +129,8 @@ function calibrateLogit(rawLogit: number): number {
 /** Raw log-odds (z-score) for one side of a CFB game — NOT a probability. */
 function cfbRawLogit(t: CfbModelInputs, o: CfbModelInputs, isHome: boolean): number {
   let z = isHome ? CFB_HOME_ADV : 0;
-  z += (t.winRate - o.winRate) * CFB_COEF_WIN_RATE;
-  z += (t.ppg - o.ppg) * CFB_COEF_PPG;
+  z += clampFeature((t.winRate - o.winRate) * CFB_COEF_WIN_RATE, MAX_FEATURE_LOGIT.winRate);
+  z += clampFeature((t.margin - o.margin) * CFB_COEF_MARGIN, MAX_FEATURE_LOGIT.margin);
   return z;
 }
 
@@ -172,8 +226,17 @@ export function computeCfbModelEdges(games: CfbGame[]): CfbModelEdge[] {
 
       const reasons: string[] = [];
       if (t.winRate > o.winRate + 0.03) reasons.push(`${(t.winRate * 100).toFixed(0)}% win rate`);
-      if (t.ppg > o.ppg + 2) reasons.push(`${t.ppg.toFixed(1)} PPG offense`);
+      if (t.margin > o.margin + 4) reasons.push(`${t.margin.toFixed(1)} adj. margin`);
+      else if (t.margin > o.margin + 1) reasons.push(`${(t.margin - o.margin).toFixed(1)} adj. margin edge`);
       if (side === "home") reasons.push("Home field");
+      // A 10pp+ disagreement is either a real opportunity or a data problem, so
+      // it is FLAGGED here exactly as the picks sections flag it. The edges list
+      // previously surfaced these silently while analyzeCfbFavorites warned
+      // about them, so the same 40pp edge read as routine in one place and
+      // alarming in the other.
+      if (edge >= HIGH_EDGE_THRESHOLD) {
+        reasons.push("⚠ HIGH EDGE — needs validation");
+      }
       // One side can clear the floor while the other hasn't. Say why the
       // confidence grade is reduced rather than just showing a B/C.
       if (!(t.complete && o.complete)) {

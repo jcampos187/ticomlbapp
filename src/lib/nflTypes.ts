@@ -14,6 +14,11 @@ export interface NflPropCandidate {
   receivingYardsPerGame: number | null;
   receivingTdsPerGame: number | null;
   receptionsPerGame: number | null;
+  /** True when the per-game rates above are a blend of this season's thin
+   *  sample and the prior season's (see blendPlayerStats). */
+  blendedWithPrior?: boolean;
+  /** Games the prior season contributed to the blend. */
+  priorGamesPlayed?: number;
 }
 
 export interface NflGame {
@@ -41,6 +46,16 @@ export interface NflGame {
   // Team scoring context (points per game)
   awayPpg: number | null;
   homePpg: number | null;
+  /** Points allowed per game — the defensive half of scoring margin. */
+  awayPpgAllowed: number | null;
+  homePpgAllowed: number | null;
+  /**
+   * Opponent-adjusted net scoring margin (an SRS-style rating in points per
+   * game, centred on 0) — the model's actual margin input. Null when the team
+   * is absent from the season graph.
+   */
+  awayAdjMargin: number | null;
+  homeAdjMargin: number | null;
   // Opponent defensive context: what each team's defense allows per game
   // (from the site API's `results.opponent` split). Used for prop projections.
   awayDefPassYds: number | null;
@@ -107,6 +122,10 @@ export interface NflPropPick {
   matchup: "easy" | "tough";
   playerAvg: number | null;
   statsSeason: number;
+  /** Where `playerAvg` came from, e.g. "2026 (1 GP)" or
+   *  "2026 (1 GP) + 2025 (17 GP) blended" — so a tracked pick still shows how
+   *  thin its sample was after the fact. */
+  statsBasis: string;
   reasons: string[];
 }
 

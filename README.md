@@ -61,6 +61,20 @@ Pitcher stats are regressed toward league average by sample size (empirical Baye
 > ℹ️ **The feature set changed, so the calibration in `src/lib/calibration.json` was re-fitted to match.** It is stamped `featureSet: 2` and is near-identity (`A ≈ 1.02`, `B ≈ 0`) — a fit that changes almost nothing, because the model is already close to calibrated. Re-run `npm run backtest` after any change to the model's inputs; the debug view's calibration chart shows whether the shipped fit still matches the shipped model (see below).
 >
 > `scripts/backtest-model.mjs` reproduces the production model, including the five-metric starter package and the empirical-Bayes shrinkage, and `tests/calculations.test.ts` asserts the two files share the same coefficients, caps, priors and feature-set version — so the fit cannot silently describe a model that no longer exists.
+>
+> ⚠️ **The MLB backtest is still look-ahead, unlike the CFB/NFL one.**
+> `fetchTeamStats` reads each team's *full-season* R/G, bullpen ERA and record,
+> and `fetchPitcherStats` reads full-season ERA/K9/FIP/BB9/HR9 — then uses them
+> to "predict" mid-season games. As of Aug 1 a team's full-season R/G differs
+> from its point-in-time R/G by 0.176 runs on average (max 0.413) against a
+> league spread of ~1.5, and every pitcher line sees months of its own future.
+> So the MLB Brier, the reliability chart and the `A ≈ 1.02` fit are all
+> optimistic, and `calibration.json` was fitted on that data. **Do not add new
+> MLB features (including opponent adjustment) until this harness is
+> point-in-time** — a change measured on a leaky harness cannot be trusted either
+> way. Making it point-in-time means rebuilding R/G and records from the
+> schedule graph (cheap: one request returns a whole season) and rebuilding
+> bullpen/pitcher lines from per-game boxscores (~2.4k requests, so cache them).
 
 ### Pick categories (kept deliberately separate)
 
@@ -70,26 +84,99 @@ Pitcher stats are regressed toward league average by sample size (empirical Baye
 
 ### Why the CFB / NFL model sections are empty early in the season
 
-The CFB and NFL models have only two inputs: win rate and points per game. A
-record is not used until a team has played 4 games, so before week 4-5 the
+The CFB and NFL models have two inputs: win rate and **opponent-adjusted
+scoring margin**. The margin is an SRS-style rating (`src/lib/srs.ts`) solved
+over the whole season's game graph:
+
+```
+rating_i = avg_margin_i + avg(rating of i's opponents)
+```
+
+That is what makes the feature usable. Two earlier versions were not: the
+offense-only points-per-game term could not see a defense (a team scoring 28
+while conceding 14 was modelled the same as one scoring 28 and conceding 34),
+and the raw net margin that replaced it was not comparable across schedules — a
+30-point win over an FCS tune-up counted exactly as much as one over a
+contender. Ratings are centred on zero, so an unknown team is still exactly
+average, and the feature is capped per feature the way MLB caps its inputs.
+
+Measured on the 2025 season (point-in-time — a rating is built only from games
+that finished earlier, so no prediction ever sees its own result), raw margin
+versus the adjusted rating on identical games:
+
+| Sport | Raw margin Brier | Adjusted Brier | Raw log-loss | Adjusted log-loss |
+|-------|------------------|----------------|--------------|-------------------|
+| CFB (526 games) | 0.2122 | **0.1855** | 0.6495 | **0.5473** |
+| NFL (129 games) | 0.2286 | **0.2181** | 0.6655 | **0.6263** |
+
+The adjustment earns its keep in CFB, where schedules vary wildly (FCS
+tune-ups), and improves every third of the season. In the NFL schedules are
+balanced, so the gain is smaller — the mechanism is shared rather than
+duplicated for a difference that is close to the noise floor. (The shipped fits
+carry Brier 0.1841 for CFB and 0.2202 for NFL; the small gaps are the backtest
+using ESPN's reconstructed records rather than graph-derived ones.)
+
+#### Ratings are shrunk by sample size
+
+A raw SRS has a small-sample blow-up, and in CFB it is not a corner case: a
+large share of teams play exactly **one** game (FCS schools taking a body-bag
+paycheck). A one-game team's rating is just its single result plus its
+opponent's rating, so a 60-point loss pins a rating near −70. Because ratings
+are centred, those teams do not cancel — they drag the zero point and inflate
+everyone else, which is how a 4-0 team came out at ~+54 in a league whose real
+ratings span about ±25 and printed a 40pp edge on a real slate.
+
+So each rating is shrunk toward league average by its sample size —
+`rating × games / (games + SRS_PRIOR_GAMES)` (`SRS_PRIOR_GAMES = 10`), the same
+empirical-Bayes idea as the MLB pitcher priors. On the 2025 season it improved
+both sports *and* both the early and late thirds (so it is not just an
+early-season crutch): CFB Brier 0.1920 → 0.1871 and NFL 0.2206 → 0.2181 before
+the cap was re-tuned. Shrinkage also bounds the feature on its own, which is
+why the CFB margin cap could be relaxed to 2.0 afterwards.
+
+> ⚠️ **The old `featureSet: 2` fits were measured with look-ahead.** The
+> backtest read each team's *full-season* scoring stats to "predict" mid-season
+> games, which inflates accuracy; the ratings above are point-in-time, so the
+> honest numbers are worse than the ones those files carried. A new fit
+> compared against an old one is not apples to apples.
+
+A record is not used until a team has played 4 games, so before week 4-5 the
 win-rate term falls back to the league average **on both sides** and the model
-collapses to a single scoring term — and PPG is not opponent-adjusted.
+collapses to a single scoring term.
 
-On real slates that produced `UT Martin +4000 · model 46.7% · edge +44.3pp ·
-EV +1815%` (CFB week 3) and `Giants +295 · model 82.7% · edge +58.4pp`
-(NFL week 2). Those are the absence of a model, not opportunities, so every
-model-driven section (Model Edge Picks **and** Top Moneyline Picks) fails closed
-until at least one side clears the 4-game floor. The schedule, spread (ATS) and
-totals sections do not use the model and stay populated throughout.
+On real slates the unadjusted model produced `UT Martin +4000 · model 46.7% ·
+edge +44.3pp · EV +1815%` (CFB week 3) and `Giants +295 · model 82.7% · edge
++58.4pp` (NFL week 2). Those are the absence of a model, not opportunities, so
+every model-driven section (Model Edge Picks **and** Top Moneyline Picks) fails
+closed: a side needs a real record **and** an opponent-adjusted rating. The
+schedule, spread (ATS) and totals sections do not use the model and stay
+populated throughout.
 
-The durable fix is a model change, not a UI one: give CFB/NFL an
-opponent-adjusted scoring-margin feature and per-feature logit caps like MLB's,
-then re-fit `calibration-cfb.json` / `calibration-nfl.json` with
-`npm run backtest -- --sport cfb|nfl`.
+Every rating is built **strictly** from games that finished on an earlier date
+(`computeMarginsAsOf`), and the backtest is pinned to the same contract: a test
+asserts its date filter is strict and that it has no full-season stat source —
+the exact look-ahead that inflated the old fits.
 
-A per-feature cap alone does NOT fix it, which is worth knowing before trying:
-the failure is that an unadjusted season average is compared against a sharp
-price for an opponent it never played, so the wrong sign survives any cap.
+The fit cannot silently go stale: `calibration-cfb.json` /
+`calibration-nfl.json` are stamped `featureSet: 3` and re-fitted with
+`npm run backtest -- --sport cfb|nfl`, the backtest mirrors `srs.ts` (including
+`SRS_ITERATIONS` and `SRS_PRIOR_GAMES`), and tests assert the two agree.
+
+A 10pp+ disagreement is flagged wherever it appears: the edges list now carries
+the same `⚠ HIGH EDGE — needs validation` warning the picks sections always
+had, so the same edge can no longer read as routine in one place and alarming
+in the other.
+
+> ℹ️ **Do not try to "fix" an early-season edge with a tighter cap.** The
+> failure was an unadjusted season average being compared against a sharp price
+> for an opponent it never played, so the wrong sign survives any cap. The fix
+> is the adjustment, not the cap.
+
+In production the graph comes from per-day scoreboards. ESPN has no compact
+season-results endpoint (the core events list is `$ref`s with no scores, a team
+schedule is ~600 KB per team, and range queries are rejected), so the season is
+swept a day at a time. Completed days are immutable and cached for a day, so the
+cost is paid once warm rather than on every analysis run.
 
 ### Spread, totals and props stay populated
 

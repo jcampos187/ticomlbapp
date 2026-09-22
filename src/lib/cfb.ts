@@ -1,12 +1,14 @@
 import type { CfbWeekInfo } from "./cfbTypes";
+import { mapWithConcurrency } from "./concurrency";
+import type { SrsGame } from "./srs";
 
 const SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard";
 const TEAM_STATS_BASE = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams";
 
 // NOTE: Do NOT set a custom User-Agent header. ESPN's edge (Akamai)
 // fingerprint-checks the UA and returns 403 for any custom value.
-async function fetchJson(url: string): Promise<any> {
-  const resp = await fetch(url, { next: { revalidate: 300 } });
+async function fetchJson(url: string, revalidate = 300): Promise<any> {
+  const resp = await fetch(url, { next: { revalidate } });
   if (!resp.ok) throw new Error(`ESPN CFB API error: ${resp.status} ${resp.statusText}`);
   return resp.json();
 }
@@ -269,6 +271,84 @@ export async function fetchCfbScoreboard(
 
 export interface TeamSeasonStats {
   pointsPerGame: number | null;
+  /** Points this team's defense allows per game — the site API's
+   *  `results.opponent` scoring split. This is the other half of scoring
+   *  margin; offense-only PPG can't tell a good defense from a bad one. */
+  pointsAllowedPerGame: number | null;
+}
+
+// ─── Season results (the opponent-adjustment graph) ─────────────────
+
+/** First day of a CFB season sweep. Week 0 is late August. */
+const CFB_SEASON_START = "08-15";
+
+/**
+ * Cap on days swept. Bounds a malformed season year into a known number of
+ * upstream requests rather than an unbounded loop.
+ */
+const MAX_SEASON_DAYS = 200;
+
+/** Concurrent season-scoreboard fetches. */
+const SEASON_GRAPH_CONCURRENCY = 8;
+
+/**
+ * Every completed CFB game of the season, as the raw material for the
+ * opponent-adjusted margin (see `computeOpponentAdjustedMargins`).
+ *
+ * ESPN exposes no compact season-wide results endpoint: the core events list
+ * is `$ref`s with no scores, the team schedule is ~600 KB per team, and range
+ * (`dates=A-B`) queries are rejected with a 400. A day query is the only shape
+ * that returns scores, so the season is swept one day at a time.
+ *
+ * That sweep is affordable because completed days are immutable: past days are
+ * cached for a day (`revalidate: 86400`) and only today's URL is refetched
+ * often, so the cost is paid once warm rather than on every analysis run. Games
+ * that have not finished are skipped — a rating built from future results would
+ * be look-ahead.
+ */
+export async function fetchCfbSeasonResults(seasonYear: number): Promise<SrsGame[]> {
+  const today = new Date().toISOString().slice(0, 10);
+  const start = `${seasonYear}-${CFB_SEASON_START}`;
+  const days = eachDay(start, today, MAX_SEASON_DAYS);
+  if (days.length === 0) return [];
+
+  const settled = await mapWithConcurrency(days, SEASON_GRAPH_CONCURRENCY, async day => {
+    const isToday = day === today.replace(/-/g, "");
+    try {
+      const data = await fetchJson(
+        `${SCOREBOARD_URL}?dates=${day}&seasontype=2&season=${seasonYear}&limit=100`,
+        isToday ? 300 : 86400,
+      );
+      return (data.events || []) as any[];
+    } catch {
+      // One unreadable day degrades the graph slightly; it must not take the
+      // whole analysis down, so surface an empty day instead.
+      return [];
+    }
+  });
+
+  const games: SrsGame[] = [];
+  for (const events of settled) {
+    for (const event of events) {
+      if (event.status?.type?.state !== "post") continue;
+      const comp = event.competitions?.[0];
+      if (!comp) continue;
+      const away = comp.competitors?.find((c: any) => c.homeAway === "away");
+      const home = comp.competitors?.find((c: any) => c.homeAway === "home");
+      if (!away || !home) continue;
+
+      const awayTeamId = Number(away.team?.id);
+      const homeTeamId = Number(home.team?.id);
+      // ESPN returns scores as strings on the scoreboard.
+      const awayScore = Number(away.score);
+      const homeScore = Number(home.score);
+      if (!Number.isFinite(awayTeamId) || !Number.isFinite(homeTeamId)) continue;
+      if (!Number.isFinite(awayScore) || !Number.isFinite(homeScore)) continue;
+
+      games.push({ homeTeamId, awayTeamId, homeScore, awayScore });
+    }
+  }
+  return games;
 }
 
 export async function fetchCfbTeamStats(teamId: number, year: number): Promise<TeamSeasonStats | null> {
@@ -277,16 +357,24 @@ export async function fetchCfbTeamStats(teamId: number, year: number): Promise<T
     const data = await fetchJson(url);
     const results = data?.results || {};
     const ownCats = results.stats?.categories || [];
+    // What opponents did against this team (i.e. what its defense allows).
+    const oppCats = results.opponent || [];
 
-    const find = (catName: string, statName: string): number | null => {
-      const cat = ownCats.find((c: any) => c.name === catName);
+    const read = (cats: any[], catName: string, statName: string): number | null => {
+      const cat = cats.find((c: any) => c.name === catName);
       const stat = cat?.stats?.find((s: any) => s.name === statName);
-      if (stat?.value == null) return null;
-      const n = Number(stat.value);
+      // CFB's opponent split omits `perGameValue`; NFL's carries it. Prefer it
+      // when present, and never treat a missing stat as a zero allowance.
+      const raw = stat?.perGameValue ?? stat?.value;
+      if (raw == null) return null;
+      const n = Number(raw);
       return Number.isNaN(n) ? null : n;
     };
 
-    return { pointsPerGame: find("scoring", "totalPointsPerGame") };
+    return {
+      pointsPerGame: read(ownCats, "scoring", "totalPointsPerGame"),
+      pointsAllowedPerGame: read(oppCats, "scoring", "totalPointsPerGame"),
+    };
   } catch {
     return null;
   }

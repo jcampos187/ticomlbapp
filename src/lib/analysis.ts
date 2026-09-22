@@ -159,7 +159,8 @@ const MAX_FEATURE_LOGIT = {
  */
 const MAX_STARTER_BUNDLE_LOGIT = MAX_FEATURE_LOGIT.starterEra + MAX_FEATURE_LOGIT.k9;
 
-function clampFeature(term: number, cap: number): number {
+// Shared with the CFB/NFL models, which cap their features the same way.
+export function clampFeature(term: number, cap: number): number {
   return Math.max(-cap, Math.min(cap, term));
 }
 
