@@ -23,6 +23,12 @@
  *     node scripts/backtest-model.mjs --sport nfl --days 60             # NFL, last 60 days
  *     node scripts/backtest-model.mjs --sport cfb --from 2025-09-01 --to 2025-09-30
  *     node scripts/backtest-model.mjs --sample 50                       # print 50 game details
+ *     node scripts/backtest-model.mjs --sport cfb --holdout 0.3         # score the fit out-of-sample
+ *
+ * --holdout fits the Platt calibration on the earlier ~(1-h) of game dates and
+ * scores it on the rest, reporting both sides. The production fit is in-sample,
+ * so its own "improvement" is not evidence calibration helps; this is. It
+ * writes no calibration file.
  */
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -239,13 +245,18 @@ function confidenceGrade(edge, complete) {
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const out = { sport: "mlb", days: 30, sample: 0, from: null, to: null };
+  const out = { sport: "mlb", days: 30, sample: 0, from: null, to: null, holdout: 0 };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--sport" && args[i + 1]) out.sport = args[++i].toLowerCase();
     else if (args[i] === "--days" && args[i + 1]) out.days = Number(args[++i]);
     else if (args[i] === "--from" && args[i + 1]) out.from = args[++i];
     else if (args[i] === "--to" && args[i + 1]) out.to = args[++i];
     else if (args[i] === "--sample" && args[i + 1]) out.sample = Number(args[++i]);
+    else if (args[i] === "--holdout") {
+      // Bare `--holdout` (or a non-numeric value) defaults to a 30% test split.
+      const frac = Number(args[i + 1]);
+      out.holdout = Number.isFinite(frac) && frac > 0 && frac < 1 ? (i++, frac) : 0.3;
+    }
   }
   if (!["mlb", "cfb", "nfl"].includes(out.sport)) {
     console.error(`Unknown sport "${out.sport}" — expected mlb, cfb, or nfl.`);
@@ -509,34 +520,33 @@ function confidenceLabel(grade) {
  *
  * Returns { A, B, brierBefore, brierAfter, logLossBefore, logLossAfter }.
  */
-function fitPlattScaling(gamesWithStats) {
-  // Collect (raw_logit, outcome) pairs from the backtest
-  // Each game contributes two data points: one for away, one for home
+/**
+ * (raw logit, actual outcome) pairs for Platt scaling — two per game: one for
+ * the home side and one for the away side, whose outcome is the mirror of the
+ * home one. Shared by the fit, the reliability buckets and the holdout
+ * evaluation so all three describe exactly the same observations.
+ */
+function plattPairs(games) {
   const data = [];
-  for (const g of gamesWithStats) {
+  for (const g of games) {
     const homeLogit = Math.log(g.homeProb / (100 - g.homeProb)); // inverse sigmoid
     const awayLogit = Math.log(g.awayProb / (100 - g.awayProb));
     data.push({ logit: homeLogit, outcome: g.homeWinner ? 1 : 0 });
     data.push({ logit: awayLogit, outcome: g.homeWinner ? 0 : 1 });
   }
+  return data;
+}
 
-  if (data.length < 20) {
-    console.log("  Not enough data for Platt scaling (< 20 samples). Skipping.");
-    return null;
-  }
-
-  // Compute pre-calibration metrics
-  const brierBefore = data.reduce((sum, d) => {
-    const p = 1 / (1 + Math.exp(-d.logit));
-    return sum + (p - d.outcome) ** 2;
-  }, 0) / data.length;
-
-  const logLossBefore = data.reduce((sum, d) => {
-    const p = Math.max(0.001, Math.min(0.999, 1 / (1 + Math.exp(-d.logit))));
-    return sum - (d.outcome * Math.log(p) + (1 - d.outcome) * Math.log(1 - p));
-  }, 0) / data.length;
-
-  // Fit A and B via gradient descent on log-loss
+/**
+ * Fit the Platt parameters A, B so that calibrated(z) = sigmoid(A*z + B) maps a
+ * raw logit to a better-calibrated probability, minimising log-loss by gradient
+ * descent.
+ *
+ * The one fitting routine in this file: the production fit and the holdout
+ * experiment below both call it, so an out-of-sample result can never be an
+ * artefact of the two paths using different optimisers.
+ */
+function fitPlattParams(data) {
   let A = 1.0;
   let B = 0.0;
   const lr = 0.01;
@@ -558,18 +568,159 @@ function fitPlattScaling(gamesWithStats) {
     B -= lr * gradB;
   }
 
-  // Compute post-calibration metrics
-  const brierAfter = data.reduce((sum, d) => {
+  return { A, B };
+}
+
+/**
+ * Brier score and log-loss of probabilities sigmoid(A*z + B) over a set of
+ * pairs. A = 1, B = 0 is the uncalibrated model, so the same routine scores the
+ * raw and the calibrated probabilities. Brier is left unclamped and log-loss
+ * clamped to [0.001, 0.999], matching how fitPlattScaling has always reported
+ * its before/after pair.
+ */
+function evalPlatt(data, A, B) {
+  let brier = 0;
+  let logLoss = 0;
+  for (const d of data) {
     const p = 1 / (1 + Math.exp(-(A * d.logit + B)));
-    return sum + (p - d.outcome) ** 2;
-  }, 0) / data.length;
+    brier += (p - d.outcome) ** 2;
+    const pc = Math.max(0.001, Math.min(0.999, p));
+    logLoss -= d.outcome * Math.log(pc) + (1 - d.outcome) * Math.log(1 - pc);
+  }
+  return { brier: brier / data.length, logLoss: logLoss / data.length, samples: data.length };
+}
 
-  const logLossAfter = data.reduce((sum, d) => {
-    const p = Math.max(0.001, Math.min(0.999, 1 / (1 + Math.exp(-(A * d.logit + B)))));
-    return sum - (d.outcome * Math.log(p) + (1 - d.outcome) * Math.log(1 - p));
-  }, 0) / data.length;
+function fitPlattScaling(gamesWithStats) {
+  const data = plattPairs(gamesWithStats);
 
-  return { A, B, brierBefore, brierAfter, logLossBefore, logLossAfter, samples: data.length };
+  if (data.length < 20) {
+    console.log("  Not enough data for Platt scaling (< 20 samples). Skipping.");
+    return null;
+  }
+
+  const before = evalPlatt(data, 1, 0);
+  const { A, B } = fitPlattParams(data);
+  const after = evalPlatt(data, A, B);
+
+  return {
+    A,
+    B,
+    brierBefore: before.brier,
+    brierAfter: after.brier,
+    logLossBefore: before.logLoss,
+    logLossAfter: after.logLoss,
+    samples: data.length,
+  };
+}
+
+/**
+ * Out-of-sample check on the Platt calibration.
+ *
+ * The production fit is in-sample: A and B are chosen to minimise error on the
+ * very games they are then scored against, so the "improvement" it reports is
+ * partly or wholly overfitting and cannot tell you whether calibrating helps.
+ * Here the season is split chronologically, the parameters are fitted on the
+ * earlier portion and scored on the later one — the way the calibration is
+ * actually used in production (fit on the past, apply to future games) — so the
+ * reported delta is a real test.
+ *
+ * The split is by game DATE, not by game, so no two games on the same slate can
+ * straddle train and test.
+ *
+ * Writes nothing: a train-only fit must not replace the shipped calibration,
+ * which stays fitted on the full window.
+ */
+function reportCalibrationHoldout(label, gamesWithStats, opts) {
+  const holdout = Math.min(0.9, Math.max(0.05, opts.holdout));
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log(`        ${label} OUT-OF-SAMPLE CALIBRATION HOLDOUT`);
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("");
+
+  const dates = [...new Set(gamesWithStats.map((g) => g.date))].sort();
+  if (dates.length < 3) {
+    console.log("  ⚠️  Not enough distinct game dates to split train/test.");
+    console.log("");
+    return;
+  }
+
+  // Chronological split: earliest dates train, latest dates test. Clamp so
+  // both sides keep at least one date and the test side is never empty.
+  const splitIndex = Math.min(
+    dates.length - 1,
+    Math.max(1, Math.floor(dates.length * (1 - holdout)))
+  );
+  const splitDate = dates[splitIndex];
+  const trainGames = gamesWithStats.filter((g) => g.date < splitDate);
+  const testGames = gamesWithStats.filter((g) => g.date >= splitDate);
+  const trainPairs = plattPairs(trainGames);
+  const testPairs = plattPairs(testGames);
+
+  const trainLabel = `${trainGames[0]?.date} → ${trainGames[trainGames.length - 1]?.date}`;
+  const testLabel = `${testGames[0]?.date} → ${testGames[testGames.length - 1]?.date}`;
+  console.log(`  Split:            last ${(holdout * 100).toFixed(0)}% of game dates held out for test`);
+  console.log(`  Train:            ${trainGames.length} games / ${trainPairs.length} samples  (${trainLabel})`);
+  console.log(`  Test:             ${testGames.length} games / ${testPairs.length} samples  (${testLabel})`);
+  console.log("");
+
+  if (trainPairs.length < 20 || testPairs.length < 20) {
+    console.log("  ⚠️  Need at least 20 samples on each side of the split — widen the date range.");
+    console.log("");
+    return;
+  }
+
+  const trainFit = fitPlattParams(trainPairs);
+  console.log(`  Train-fit params: A = ${trainFit.A.toFixed(6)}, B = ${trainFit.B.toFixed(6)}`);
+  console.log("");
+
+  const trainRaw = evalPlatt(trainPairs, 1, 0);
+  const trainCal = evalPlatt(trainPairs, trainFit.A, trainFit.B);
+  const testRaw = evalPlatt(testPairs, 1, 0);
+  const testCal = evalPlatt(testPairs, trainFit.A, trainFit.B);
+
+  // The in-sample / shipped-style fit, for contrast: it sees the test games too.
+  const allFit = fitPlattParams(plattPairs(gamesWithStats));
+  const testLeak = evalPlatt(testPairs, allFit.A, allFit.B);
+
+  const fmt = (n) => n.toFixed(4);
+  const delta = (before, after) => {
+    const pctDelta = ((after - before) / before) * 100;
+    const tag = after < before ? "better" : after > before ? "worse" : "same";
+    return `${pctDelta >= 0 ? "+" : ""}${pctDelta.toFixed(2)}% ${tag}`;
+  };
+
+  console.log("  ── TEST SET (held out — the honest number) ──");
+  console.log("  Metric       Raw model    Train-fit calib    Delta");
+  console.log("  ──────────   ──────────   ────────────────   ────────────────");
+  console.log(`  Brier        ${fmt(testRaw.brier).padStart(10)}   ${fmt(testCal.brier).padStart(16)}   ${delta(testRaw.brier, testCal.brier)}`);
+  console.log(`  Log-loss     ${fmt(testRaw.logLoss).padStart(10)}   ${fmt(testCal.logLoss).padStart(16)}   ${delta(testRaw.logLoss, testCal.logLoss)}`);
+  console.log("");
+
+  console.log("  ── TRAIN SET (in-sample — what the production fit reports) ──");
+  console.log(`  Brier        ${fmt(trainRaw.brier).padStart(10)}   ${fmt(trainCal.brier).padStart(16)}   ${delta(trainRaw.brier, trainCal.brier)}`);
+  console.log(`  Log-loss     ${fmt(trainRaw.logLoss).padStart(10)}   ${fmt(trainCal.logLoss).padStart(16)}   ${delta(trainRaw.logLoss, trainCal.logLoss)}`);
+  console.log("");
+
+  console.log("  ── REFERENCE: fit on ALL data (leaks the test games) ──");
+  console.log(`  All-data params: A = ${allFit.A.toFixed(6)}, B = ${allFit.B.toFixed(6)}`);
+  console.log(`  Test Brier ${fmt(testLeak.brier)}, log-loss ${fmt(testLeak.logLoss)}`);
+  console.log("");
+
+  const helps = testCal.brier < testRaw.brier && testCal.logLoss < testRaw.logLoss;
+  const hurts = testCal.brier > testRaw.brier && testCal.logLoss > testRaw.logLoss;
+  if (helps) {
+    console.log("  🟢 Calibration HELPS out-of-sample: both metrics improve on games");
+    console.log("     the fit never saw. Shipped A/B are doing real work.");
+  } else if (hurts) {
+    console.log("  🔴 Calibration HURTS out-of-sample: both metrics get worse on held-out");
+    console.log("     games. The in-sample gain was overfitting — do not ship this fit.");
+  } else {
+    console.log("  ⚪ NO NET OUT-OF-SAMPLE GAIN: the fit reproduces itself on held-out");
+    console.log("     games at best. The raw model is already calibrated on this window,");
+    console.log("     so the shipped A/B are near-identity and mostly a no-op.");
+  }
+  console.log("");
 }
 
 /**
@@ -1301,6 +1452,13 @@ async function runFootball(opts) {
 
   // 3. Analyze results
   console.log("Phase 3/3: Analyzing results…\n");
+
+  // Diagnostic mode: score the calibration out-of-sample and write nothing.
+  if (opts.holdout > 0) {
+    reportCalibrationHoldout(cfg.label, gamesWithStats, opts);
+    return;
+  }
+
   await reportFootball(cfg, gamesWithStats, from, to, opts);
 }
 
@@ -1440,6 +1598,12 @@ async function main() {
 
   // 3. Analyze results
   console.log("Phase 3/3: Analyzing results…\n");
+
+  // Diagnostic mode: score the calibration out-of-sample and write nothing.
+  if (opts.holdout > 0) {
+    reportCalibrationHoldout("MLB", gamesWithStats, opts);
+    return;
+  }
 
   // Overall accuracy
   const total = gamesWithStats.length;
